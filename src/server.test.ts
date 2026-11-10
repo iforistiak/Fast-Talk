@@ -233,3 +233,93 @@ test('Full in-memory WebSocket signaling, search, chat, file relay, and wipe flo
     await app.close();
   }
 });
+
+test('HTTP /api/events fallback transport supports registration, cross-transport chat, and clientToken handoff', async () => {
+  const app = createFastTalkServer({ heartbeatIntervalMs: 60000 });
+  await new Promise<void>((resolve) => app.httpServer.listen(0, '127.0.0.1', () => resolve()));
+  const address = app.httpServer.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const httpUrl = `http://127.0.0.1:${port}/api/events`;
+  const wsUrl = `ws://127.0.0.1:${port}`;
+
+  async function postEvents(connId: string, messages: any[] = []) {
+    const res = await fetch(httpUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connId, messages })
+    });
+    assert.equal(res.status, 200);
+    return (await res.json()) as { status: string; connId: string; events: any[] };
+  }
+
+  try {
+    // 1. Register HTTP client (when WebSocket is blocked)
+    const regRes = await postEvents('conn_http_peer1', [
+      {
+        type: 'register',
+        isGuest: false,
+        username: 'Http_User',
+        clientToken: 'tok_secret_123456'
+      }
+    ]);
+    const regEvt = regRes.events.find((e) => e.type === 'registered');
+    assert.ok(regEvt);
+    assert.equal(regEvt.username, 'Http_User');
+
+    // 2. Register second HTTP client and chat with first HTTP client
+    const regRes2 = await postEvents('conn_http_peer2', [
+      {
+        type: 'register',
+        isGuest: false,
+        username: 'Peer_Two',
+        clientToken: 'tok_secret_654321'
+      },
+      {
+        type: 'chat_request',
+        to: 'Http_User'
+      }
+    ]);
+    assert.ok(regRes2.events.some((e) => e.type === 'chat_request_sent'));
+
+    // Poll Peer 1 to receive incoming chat_request and accept it
+    const poll1 = await postEvents('conn_http_peer1', [
+      { type: 'chat_accept', from: 'Peer_Two' }
+    ]);
+    assert.ok(poll1.events.some((e) => e.type === 'chat_request'));
+    assert.ok(poll1.events.some((e) => e.type === 'chat_accepted'));
+
+    // Send chat message from Peer 2 to Peer 1 over HTTP
+    await postEvents('conn_http_peer2', [
+      { type: 'chat_message', id: 'm_http_1', to: 'Http_User', text: 'Working without WebSocket!' }
+    ]);
+
+    const pollMsg = await postEvents('conn_http_peer1', []);
+    const incomingMsg = pollMsg.events.find((e) => e.type === 'chat_message');
+    assert.ok(incomingMsg);
+    assert.equal(incomingMsg.text, 'Working without WebSocket!');
+
+    // 3. Test seamless clientToken handoff when Peer 1's WebSocket later connects
+    const ws = new WebSocket(wsUrl);
+    await new Promise<void>((resolve) => ws.once('open', () => resolve()));
+    const wsRegPromise = new Promise<any>((resolve) => {
+      ws.on('message', (raw) => {
+        const parsed = JSON.parse(raw.toString('utf8'));
+        if (parsed.type === 'registered') resolve(parsed);
+      });
+    });
+    ws.send(
+      JSON.stringify({
+        type: 'register',
+        isGuest: false,
+        username: 'Http_User',
+        clientToken: 'tok_secret_123456'
+      })
+    );
+    const wsReg = await wsRegPromise;
+    assert.equal(wsReg.username, 'Http_User');
+    ws.close();
+  } finally {
+    await app.close();
+  }
+});
+

@@ -1799,7 +1799,14 @@
       // ========================================================================
       const state = {
         ws: null,
+        connId: `conn_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`,
+        clientToken: `tok_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 12)}`,
         connected: false,
+        httpActive: false,
+        httpOutbox: [],
+        httpFlushInFlight: false,
+        httpPollTimer: null,
+        localBus: null,
         reconnecting: false,
         reconnectAttempts: 0,
         reconnectTimer: null,
@@ -2313,7 +2320,7 @@
       });
 
       // ========================================================================
-      // WEBSOCKET CONNECTION & AUTO-RECONNECT
+      // RESILIENT DUAL-TRANSPORT ENGINE (WEBSOCKET + HTTP /api/events FALLBACK)
       // ========================================================================
       function updateConnectionStatusUI(statusState, label) {
         els.landingConnDot.setAttribute('data-state', statusState);
@@ -2322,15 +2329,142 @@
         els.appConnText.textContent = label;
       }
 
-      function sendWs(payload) {
-        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-          state.ws.send(JSON.stringify(payload));
-          return true;
+      /**
+       * Local BroadcastChannel fallback only if both WebSocket and /api/events HTTP
+       * server endpoints are unreachable (e.g., static file preview).
+       */
+      function initLocalFallbackBus() {
+        if (state.localBus || typeof BroadcastChannel === 'undefined') return;
+        try {
+          const bus = new BroadcastChannel('fast_talk_ephemeral_bus');
+          state.localBus = bus;
+          bus.onmessage = (ev) => {
+            const data = ev.data;
+            if (!data || !state.myUsername) return;
+            const myLower = state.myUsername.toLowerCase();
+            if (data.toLower && data.toLower !== myLower) return;
+            if (data.fromLower && data.fromLower === myLower) return;
+            if (data.serverEvent) {
+              handleServerMessage(data.serverEvent);
+            }
+          };
+        } catch {
+          // ignore
         }
-        return false;
+      }
+
+      function dispatchLocalFallback(payload) {
+        initLocalFallbackBus();
+        updateConnectionStatusUI('connected', 'Connected');
+        state.connected = true;
+
+        if (payload.type === 'register') {
+          const chosen = payload.isGuest
+            ? `Guest_${Math.floor(1000 + Math.random() * 9000)}`
+            : payload.username;
+          handleServerMessage({
+            type: 'registered',
+            username: chosen,
+            joinedAt: Date.now(),
+            users: state.onlineUsers,
+            totalOnline: Math.max(1, state.onlineUsers.length + 1)
+          });
+          return;
+        }
+        if (payload.type === 'logout') {
+          handleServerMessage({ type: 'logged_out' });
+        }
+      }
+
+      async function flushHttpTransport() {
+        if (state.intentionalLogout) return;
+        if (state.ws && state.ws.readyState === WebSocket.OPEN && state.httpOutbox.length === 0) {
+          return;
+        }
+        if (state.httpFlushInFlight) return;
+        state.httpFlushInFlight = true;
+
+        const batch = state.httpOutbox.splice(0, 40);
+        try {
+          const res = await fetch('/api/events', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              connId: state.connId,
+              messages: batch
+            }),
+            cache: 'no-store'
+          });
+
+          if (!res.ok) {
+            throw new Error(`HTTP ${res.status}`);
+          }
+
+          const data = await res.json();
+          state.httpActive = true;
+          state.connected = true;
+          state.reconnecting = false;
+          updateConnectionStatusUI('connected', 'Connected');
+
+          if (Array.isArray(data.events)) {
+            for (const ev of data.events) {
+              handleServerMessage(ev);
+            }
+          }
+        } catch {
+          // If server HTTP endpoint is unreachable and we had outgoing messages, use local fallback
+          if (!state.connected && batch.length > 0) {
+            for (const item of batch) {
+              dispatchLocalFallback(item);
+            }
+          }
+        } finally {
+          state.httpFlushInFlight = false;
+          if (state.httpOutbox.length > 0) {
+            flushHttpTransport();
+          }
+        }
+      }
+
+      function ensureHttpPollLoop() {
+        if (state.httpPollTimer) return;
+        state.httpPollTimer = setInterval(() => {
+          if (state.intentionalLogout) return;
+          if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+            flushHttpTransport();
+          }
+        }, 600);
+      }
+
+      function sendWs(payload) {
+        const enriched =
+          payload && payload.type === 'register'
+            ? { ...payload, clientToken: state.clientToken }
+            : payload;
+
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          try {
+            state.ws.send(JSON.stringify(enriched));
+            return true;
+          } catch {
+            // Fall through to HTTP transport if WebSocket send throws
+          }
+        }
+
+        state.httpOutbox.push(enriched);
+        ensureHttpPollLoop();
+        flushHttpTransport();
+        return true;
       }
 
       function connectWebSocket() {
+        ensureHttpPollLoop();
+
+        // Immediately verify connectivity via HTTP transport if WS isn't open yet
+        if (!state.connected) {
+          flushHttpTransport();
+        }
+
         if (
           state.ws &&
           (state.ws.readyState === WebSocket.OPEN || state.ws.readyState === WebSocket.CONNECTING)
@@ -2339,14 +2473,17 @@
         }
 
         clearTimeout(state.reconnectTimer);
-        updateConnectionStatusUI(
-          'connecting',
-          state.reconnectAttempts > 0
-            ? `Reconnecting (${state.reconnectAttempts})...`
-            : 'Connecting...'
-        );
+        if (!state.connected && !state.httpActive) {
+          updateConnectionStatusUI('connecting', 'Connecting...');
+        }
 
-        const ws = new WebSocket(WS_SERVER_URL);
+        let ws;
+        try {
+          ws = new WebSocket(WS_SERVER_URL);
+        } catch {
+          flushHttpTransport();
+          return;
+        }
         state.ws = ws;
 
         ws.addEventListener('open', () => {
@@ -2381,24 +2518,38 @@
         });
 
         ws.addEventListener('close', () => {
-          state.connected = false;
           if (state.intentionalLogout) {
+            state.connected = false;
             updateConnectionStatusUI('disconnected', 'Disconnected');
             return;
           }
+
           state.reconnectAttempts += 1;
-          const delay = Math.min(1000 * Math.pow(1.6, state.reconnectAttempts - 1), 8000);
-          updateConnectionStatusUI(
-            'connecting',
-            `Reconnecting (${state.reconnectAttempts})...`
-          );
+          const delay = Math.min(1500 * Math.pow(1.5, state.reconnectAttempts - 1), 8000);
+
+          // Seamlessly keep session alive via HTTP /api/events without blocking UI
+          if (state.myUsername && state.httpOutbox.length === 0) {
+            state.httpOutbox.push({
+              type: 'register',
+              isGuest: false,
+              username: state.myUsername,
+              clientToken: state.clientToken
+            });
+          }
+          flushHttpTransport();
+
+          if (state.httpActive) {
+            state.connected = true;
+            updateConnectionStatusUI('connected', 'Connected');
+          }
+
           state.reconnectTimer = setTimeout(() => {
             connectWebSocket();
           }, delay);
         });
 
         ws.addEventListener('error', () => {
-          // Close handler triggers auto-reconnect
+          flushHttpTransport();
         });
       }
 
@@ -4086,8 +4237,21 @@
       // Ephemeral Rule: Tab Close / Refresh Cleanup
       function handlePageUnload() {
         try {
-          if (state.ws && state.ws.readyState === WebSocket.OPEN && state.myUsername) {
-            state.ws.send(JSON.stringify({ type: 'logout', reason: 'page_unload' }));
+          if (state.myUsername) {
+            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+              state.ws.send(JSON.stringify({ type: 'logout', reason: 'page_unload' }));
+            } else if (navigator.sendBeacon) {
+              const blob = new Blob(
+                [
+                  JSON.stringify({
+                    connId: state.connId,
+                    messages: [{ type: 'logout', reason: 'page_unload' }]
+                  })
+                ],
+                { type: 'application/json' }
+              );
+              navigator.sendBeacon('/api/events', blob);
+            }
           }
           for (const lower of Array.from(state.chats.keys())) {
             wipeSingleChatSession(lower);
@@ -4114,6 +4278,7 @@
       }
       if (urlParams.get('autostart') === '1') {
         state.desiredRegistration = { isGuest: true, username: '' };
+        sendWs({ type: 'register', isGuest: true });
       }
       })();
     </script>
