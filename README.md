@@ -1,11 +1,80 @@
-<div align="center">
+# Fast Talk
 
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+**Fast Talk** is a private, ephemeral 1-to-1 real-time communication and direct file sharing workspace built for zero-trace collaboration. It requires no accounts, uses no database, and automatically erases all session data the moment a conversation ends.
 
-  <h1>Built with AI Studio</h2>
+---
 
-  <p>The fastest path from prompt to production with Gemini.</p>
+## Ephemeral Architecture & Security Principles
 
-  <a href="https://aistudio.google.com/apps">Start building</a>
+Fast Talk is engineered around strict data minimization and zero persistence:
 
-</div>
+- **Zero Database & Zero Disk Writes**: Active sessions exist strictly in volatile memory for the duration of a live connection. Nothing is ever logged or written to disk.
+- **Zero Client Storage**: No conversation history, usernames, or shared files are stored in browser storage (`localStorage`, `sessionStorage`, or `IndexedDB`).
+- **Bilateral Session Wipe**: When either participant clicks **End chat & wipe**, logs out, or closes/refreshes their browser tab, all messages, shared files, and temporary object URLs are immediately destroyed for both users.
+- **Defense-in-Depth Input & Traffic Controls**:
+  - Strict validation on usernames (`3–20` alphanumeric characters and underscores) with case-insensitive collision protection.
+  - Complete HTML escaping on all user-supplied text and path-traversal sanitization on all shared file names.
+  - Strict HTTP security headers (`Content-Security-Policy`, `X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`, and `Permissions-Policy`).
+  - Per-session sliding-window rate limiting, frame size caps, and automated dead-connection cleanup.
+
+---
+
+## Core Features
+
+- **Instant Session Entry**: Choose a unique username or join immediately with an auto-generated Guest handle (`Guest_XXXX`).
+- **Share Invite Link & QR Code Discovery**: Generate a scannable QR code and direct invite link (`?invite=username`) so peers can connect by scanning with a mobile camera or opening the link.
+- **Live Online Directory & Search**: Real-time partial-match search across currently online peers.
+- **Consent-First 1-to-1 Requests**: Send, accept, decline, or cancel conversation requests before any messages or files can be exchanged.
+- **Real-Time Messaging & Presence**:
+  - Instant text delivery with timestamps (`HH:MM:SS`).
+  - Animated wave-dot typing indicator when your partner is composing a message.
+  - Double-check read receipts (`Sent` single check and `Read` double check) updated live when your partner views the active conversation.
+  - Focus-aware notification sound effect with a mute/unmute toggle.
+  - Unread message badges across active conversations.
+- **Direct File Sharing (Up to 100 MB)**:
+  - Live transfer progress bar and percentage status.
+  - Mid-transfer cancellation from either side.
+  - Inline image preview and one-click file download.
+- **Responsive Dual-Theme Interface**:
+  - Mobile-first single-pane navigation with bottom-fixed controls and `>= 44px` touch targets, expanding to a split sidebar and workspace layout on tablets and desktops.
+  - Instant switching between Light and Dark corporate themes.
+
+---
+
+## Installation & Run Instructions
+
+### Prerequisites
+
+- A standard JavaScript server runtime (`v18+` recommended).
+
+### 1. Install Dependencies
+
+```bash
+npm install
+```
+
+### 2. Start the Application
+
+```bash
+npm start
+```
+
+By default, the server listens on port `3000` (or the port specified via the `PORT` environment variable):
+
+```bash
+PORT=3000 npm start
+```
+
+Open `http://localhost:3000` in your browser. To test 1-to-1 chat and QR invite discovery locally, open a second browser window or scan the generated invite QR code.
+
+---
+
+## License
+
+This project is licensed under the **MIT License** — see the [LICENSE](./LICENSE) file for full details.
+
+Copyright (c) 2026 **MD. ISTIAK ISLAM**
+
+---
+
+**Ideas Deployed By - MD. ISTIAK ISLAM**

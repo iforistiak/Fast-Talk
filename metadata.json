@@ -1,0 +1,6 @@
+{
+  "name": "Fast Talk",
+  "description": "Ephemeral 1-to-1 real-time private communication and direct file sharing workspace with zero database persistence.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
