@@ -317,9 +317,25 @@ test('HTTP /api/events fallback transport supports registration, cross-transport
     );
     const wsReg = await wsRegPromise;
     assert.equal(wsReg.username, 'Http_User');
+
+    // 4. Test smart search (@prefix, underscore-free, and GET /api/users)
+    const apiUsersRes = await fetch(
+      `http://127.0.0.1:${port}/api/users?q=${encodeURIComponent('@peer two')}&exclude=Http_User`
+    );
+    assert.equal(apiUsersRes.status, 200);
+    const apiUsersJson = (await apiUsersRes.json()) as {
+      users: Array<{ username: string }>;
+      allUsers: Array<{ username: string }>;
+      totalOnline: number;
+    };
+    assert.equal(apiUsersJson.users.length, 1);
+    assert.equal(apiUsersJson.users[0].username, 'Peer_Two');
+    assert.equal(apiUsersJson.allUsers.length, 1);
+
     ws.close();
   } finally {
     await app.close();
   }
 });
+
 

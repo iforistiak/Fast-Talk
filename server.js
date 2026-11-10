@@ -198,21 +198,86 @@ export function createFastTalkServer(options = {}) {
     }
   }
 
+  function normalizeTargetHandle(raw) {
+    if (typeof raw !== 'string') return '';
+    return raw.trim().replace(/^@+/, '').trim();
+  }
+
+  function resolveOnlineUserSession(rawInput, excludeLower = '') {
+    const clean = normalizeTargetHandle(rawInput);
+    if (!clean) return null;
+    const cleanLower = clean.toLowerCase();
+
+    const direct = usersByLower.get(cleanLower);
+    if (direct && direct.lower !== excludeLower && isConnectionActive(direct.conn)) {
+      return direct;
+    }
+
+    // Support 4-digit Guest ID shorthand (e.g. "4821" -> "Guest_4821")
+    if (/^\d{4}$/.test(cleanLower)) {
+      const guestSession = usersByLower.get(`guest_${cleanLower}`);
+      if (guestSession && guestSession.lower !== excludeLower && isConnectionActive(guestSession.conn)) {
+        return guestSession;
+      }
+    }
+
+    // Support normalized match without underscores/spaces (e.g. "guest4821" -> "Guest_4821")
+    const normInput = cleanLower.replace(/[\s_-]+/g, '');
+    if (normInput.length >= 3) {
+      for (const [lower, session] of usersByLower.entries()) {
+        if (lower === excludeLower) continue;
+        if (!isConnectionActive(session.conn)) continue;
+        if (lower.replace(/_/g, '') === normInput) {
+          return session;
+        }
+      }
+    }
+
+    return null;
+  }
+
   function searchOnlineUsers(excludeLower, query = '') {
-    const cleanQuery = typeof query === 'string' ? query.trim().toLowerCase() : '';
-    const results = [];
+    const cleanQuery = normalizeTargetHandle(query).toLowerCase();
+    const normQuery = cleanQuery.replace(/[\s_-]+/g, '');
+    const scored = [];
+
     for (const [lower, session] of usersByLower.entries()) {
       if (lower === excludeLower) continue;
       if (!isConnectionActive(session.conn)) continue;
-      if (!cleanQuery || lower.includes(cleanQuery)) {
-        results.push({
+
+      if (!cleanQuery) {
+        scored.push({
+          score: 10,
+          username: session.username,
+          joinedAt: session.joinedAt
+        });
+        continue;
+      }
+
+      const normLower = lower.replace(/_/g, '');
+      let score = -1;
+
+      if (lower === cleanQuery || (normQuery && normLower === normQuery)) {
+        score = 0; // Exact match
+      } else if (/^\d{4}$/.test(cleanQuery) && lower === `guest_${cleanQuery}`) {
+        score = 0; // Exact 4-digit Guest ID match
+      } else if (lower.startsWith(cleanQuery) || (normQuery && normLower.startsWith(normQuery))) {
+        score = 1; // Prefix match
+      } else if (lower.includes(cleanQuery) || (normQuery && normLower.includes(normQuery))) {
+        score = 2; // Substring / normalized match
+      }
+
+      if (score !== -1) {
+        scored.push({
+          score,
           username: session.username,
           joinedAt: session.joinedAt
         });
       }
     }
-    results.sort((a, b) => a.username.localeCompare(b.username));
-    return results;
+
+    scored.sort((a, b) => a.score - b.score || a.username.localeCompare(b.username));
+    return scored.map(({ username, joinedAt }) => ({ username, joinedAt }));
   }
 
   function broadcastDirectoryUpdate() {
@@ -223,6 +288,68 @@ export function createFastTalkServer(options = {}) {
         totalOnline: usersByLower.size
       });
     }
+  }
+
+  function ensureSessionBound(conn, rawUsername, rawClientToken) {
+    if (!conn) return null;
+    if (conn.userLower && usersByLower.has(conn.userLower)) {
+      const active = usersByLower.get(conn.userLower);
+      if (active) {
+        active.conn = conn;
+        conn.lastSeen = Date.now();
+        return active;
+      }
+    }
+
+    const check = validateUsername(normalizeTargetHandle(rawUsername));
+    if (!check.valid) return null;
+
+    const lower = check.username.toLowerCase();
+    const clientToken =
+      typeof rawClientToken === 'string' && rawClientToken.length >= 8 && rawClientToken.length <= 80
+        ? rawClientToken
+        : null;
+
+    const existing = usersByLower.get(lower);
+    if (existing) {
+      if (!existing.clientToken || (clientToken && existing.clientToken === clientToken)) {
+        if (existing.conn && existing.conn !== conn) {
+          existing.conn.userLower = null;
+          if (existing.conn.outbox.length > 0) {
+            for (const queued of existing.conn.outbox.splice(0, existing.conn.outbox.length)) {
+              sendToConn(conn, queued);
+            }
+          }
+        }
+        existing.conn = conn;
+        existing.ws = conn.ws;
+        if (clientToken) existing.clientToken = clientToken;
+        conn.userLower = lower;
+        conn.lastSeen = Date.now();
+        return existing;
+      }
+      return null;
+    }
+
+    // Automatically restore session if it was dropped by a socket blip
+    const restored = {
+      username: check.username,
+      lower,
+      clientToken,
+      conn,
+      ws: conn.ws,
+      joinedAt: Date.now(),
+      activePartners: new Set(),
+      incomingRequests: new Set(),
+      outgoingRequests: new Set(),
+      controlLimiter: new SlidingWindowLimiter(80, 10000),
+      chunkLimiter: new SlidingWindowLimiter(1400, 5000)
+    };
+    usersByLower.set(lower, restored);
+    conn.userLower = lower;
+    conn.lastSeen = Date.now();
+    broadcastDirectoryUpdate();
+    return restored;
   }
 
   function cleanupUserSession(lower, reason = 'disconnected') {
@@ -442,7 +569,24 @@ export function createFastTalkServer(options = {}) {
       return;
     }
 
-    const currentSession = conn.userLower ? usersByLower.get(conn.userLower) : null;
+    let currentSession = conn.userLower ? usersByLower.get(conn.userLower) : null;
+    if (!currentSession && typeof msg._user === 'string') {
+      currentSession = ensureSessionBound(conn, msg._user, msg._token);
+    }
+
+    // Allow search_users even if session is not yet bound
+    if (msg.type === 'search_users' && !currentSession) {
+      const query = typeof msg.query === 'string' ? msg.query.slice(0, 40) : '';
+      const matches = searchOnlineUsers('', query);
+      sendToConn(conn, {
+        type: 'search_results',
+        query,
+        users: matches,
+        totalOnline: usersByLower.size
+      });
+      return;
+    }
+
     if (!currentSession) {
       sendToConn(conn, {
         type: 'error',
@@ -498,6 +642,7 @@ export function createFastTalkServer(options = {}) {
         type: 'search_results',
         query,
         users: matches,
+        allUsers: searchOnlineUsers(currentSession.lower, ''),
         totalOnline: usersByLower.size
       });
       return;
@@ -507,8 +652,9 @@ export function createFastTalkServer(options = {}) {
     // 4. CHAT REQUEST / CANCEL / ACCEPT / DECLINE
     // ------------------------------------------------------------------------
     if (msg.type === 'chat_request') {
-      const targetRaw = typeof msg.to === 'string' ? msg.to.trim() : '';
-      const targetLower = targetRaw.toLowerCase();
+      const targetRaw = normalizeTargetHandle(msg.to);
+      const targetSession = resolveOnlineUserSession(targetRaw, currentSession.lower);
+      const targetLower = targetSession ? targetSession.lower : targetRaw.toLowerCase();
 
       if (!targetLower || targetLower === currentSession.lower) {
         sendToConn(conn, {
@@ -519,12 +665,11 @@ export function createFastTalkServer(options = {}) {
         return;
       }
 
-      const targetSession = usersByLower.get(targetLower);
       if (!targetSession || !isConnectionActive(targetSession.conn)) {
         sendToConn(conn, {
           type: 'error',
           code: 'USER_OFFLINE',
-          message: `User "${targetRaw}" is no longer online.`
+          message: `User "@${targetRaw}" is not currently online.`
         });
         return;
       }
@@ -580,7 +725,7 @@ export function createFastTalkServer(options = {}) {
     }
 
     if (msg.type === 'chat_request_cancel') {
-      const targetLower = typeof msg.to === 'string' ? msg.to.trim().toLowerCase() : '';
+      const targetLower = normalizeTargetHandle(msg.to).toLowerCase();
       const targetSession = usersByLower.get(targetLower);
       currentSession.outgoingRequests.delete(targetLower);
       if (targetSession) {
@@ -594,9 +739,9 @@ export function createFastTalkServer(options = {}) {
     }
 
     if (msg.type === 'chat_accept') {
-      const requesterRaw = typeof msg.from === 'string' ? msg.from.trim() : '';
-      const requesterLower = requesterRaw.toLowerCase();
-      const requesterSession = usersByLower.get(requesterLower);
+      const requesterRaw = normalizeTargetHandle(msg.from);
+      const requesterSession = resolveOnlineUserSession(requesterRaw, currentSession.lower);
+      const requesterLower = requesterSession ? requesterSession.lower : requesterRaw.toLowerCase();
 
       if (!requesterSession || !isConnectionActive(requesterSession.conn)) {
         currentSession.incomingRequests.delete(requesterLower);
@@ -640,7 +785,7 @@ export function createFastTalkServer(options = {}) {
     }
 
     if (msg.type === 'chat_decline') {
-      const requesterRaw = typeof msg.from === 'string' ? msg.from.trim() : '';
+      const requesterRaw = normalizeTargetHandle(msg.from);
       const requesterLower = requesterRaw.toLowerCase();
       const requesterSession = usersByLower.get(requesterLower);
 
@@ -660,7 +805,7 @@ export function createFastTalkServer(options = {}) {
     // ------------------------------------------------------------------------
     // 5. ACTIVE PARTNER VERIFICATION FOR MESSAGING, WEBRTC & FILE RELAY
     // ------------------------------------------------------------------------
-    const partnerRaw = typeof msg.to === 'string' ? msg.to.trim() : '';
+    const partnerRaw = normalizeTargetHandle(msg.to);
     const partnerLower = partnerRaw.toLowerCase();
     const partnerSession = usersByLower.get(partnerLower);
 
@@ -881,6 +1026,28 @@ export function createFastTalkServer(options = {}) {
       return;
     }
 
+    // Fast Online Username Search & Directory Endpoint (GET /api/users?q=...&exclude=...)
+    if (req.method === 'GET' && reqUrl.pathname === '/api/users') {
+      const q = reqUrl.searchParams.get('q') || '';
+      const excludeRaw = normalizeTargetHandle(reqUrl.searchParams.get('exclude') || '').toLowerCase();
+      const users = searchOnlineUsers(excludeRaw, q);
+      const allUsers = searchOnlineUsers(excludeRaw, '');
+      res.writeHead(200, {
+        ...SECURITY_HEADERS,
+        'Content-Type': 'application/json; charset=utf-8'
+      });
+      res.end(
+        JSON.stringify({
+          status: 'ok',
+          query: q,
+          users,
+          allUsers,
+          totalOnline: usersByLower.size
+        })
+      );
+      return;
+    }
+
     // Real-time HTTP Polling & Event Dispatch Fallback (/api/events)
     if (req.method === 'POST' && reqUrl.pathname === '/api/events') {
       let body = '';
@@ -928,6 +1095,11 @@ export function createFastTalkServer(options = {}) {
         const conn = createVirtualConnection(rawConnId, null);
         conn.lastSeen = Date.now();
 
+        // Automatically bind or restore user session if envelope has username + clientToken
+        if (typeof payload.username === 'string' && payload.username.trim()) {
+          ensureSessionBound(conn, payload.username, payload.clientToken);
+        }
+
         if (Array.isArray(payload.messages)) {
           for (const m of payload.messages.slice(0, 50)) {
             processProtocolMessage(conn, m);
@@ -935,6 +1107,8 @@ export function createFastTalkServer(options = {}) {
         }
 
         const events = conn.outbox.splice(0, conn.outbox.length);
+        const onlineSnapshot = conn.userLower ? searchOnlineUsers(conn.userLower, '') : undefined;
+
         res.writeHead(200, {
           ...SECURITY_HEADERS,
           'Content-Type': 'application/json; charset=utf-8'
@@ -943,7 +1117,9 @@ export function createFastTalkServer(options = {}) {
           JSON.stringify({
             status: 'ok',
             connId: conn.id,
-            events
+            events,
+            onlineUsers: onlineSnapshot,
+            totalOnline: usersByLower.size
           })
         );
       });
@@ -980,6 +1156,39 @@ export function createFastTalkServer(options = {}) {
     server: httpServer,
     maxPayload: MAX_WS_PAYLOAD_BYTES
   });
+
+  function handleWsDisconnect(conn, reason) {
+    conn.ws = null;
+    if (!conn.userLower) {
+      connectionsById.delete(conn.id);
+      return;
+    }
+    const lower = conn.userLower;
+    const session = usersByLower.get(lower);
+
+    // If this is a dual-transport browser session (with clientToken), give HTTP fallback / WS reconnect a 4.5s grace window
+    if (session && session.clientToken) {
+      conn.lastSeen = Date.now();
+      const disconnectTime = conn.lastSeen;
+      const timer = setTimeout(() => {
+        const current = usersByLower.get(lower);
+        if (!current) return;
+        const activeWs = current.conn && current.conn.ws && current.conn.ws.readyState === WebSocket.OPEN;
+        const polledSinceDisconnect = current.conn && current.conn.lastSeen > disconnectTime;
+        if (!activeWs && !polledSinceDisconnect) {
+          current.conn.userLower = null;
+          cleanupUserSession(lower, reason);
+          connectionsById.delete(conn.id);
+        }
+      }, 4500);
+      timer.unref?.();
+      return;
+    }
+
+    conn.userLower = null;
+    cleanupUserSession(lower, reason);
+    connectionsById.delete(conn.id);
+  }
 
   // ==========================================================================
   // WEBSOCKET CONNECTION HANDLER
@@ -1020,21 +1229,11 @@ export function createFastTalkServer(options = {}) {
     });
 
     ws.on('close', () => {
-      if (conn.userLower) {
-        const lower = conn.userLower;
-        conn.userLower = null;
-        cleanupUserSession(lower, 'socket_closed');
-      }
-      connectionsById.delete(conn.id);
+      handleWsDisconnect(conn, 'socket_closed');
     });
 
     ws.on('error', () => {
-      if (conn.userLower) {
-        const lower = conn.userLower;
-        conn.userLower = null;
-        cleanupUserSession(lower, 'socket_error');
-      }
-      connectionsById.delete(conn.id);
+      handleWsDisconnect(conn, 'socket_error');
     });
   });
 

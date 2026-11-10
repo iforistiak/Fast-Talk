@@ -1466,7 +1466,7 @@
                 type="search"
                 id="user-search-input"
                 class="input-field"
-                placeholder="Search online username..."
+                placeholder="Search @username or 4-digit Guest ID..."
                 autocomplete="off"
                 spellcheck="false"
                 aria-label="Search online users by username"
@@ -1878,11 +1878,16 @@
           .replace(/'/g, '&#39;');
       }
 
+      function normalizeHandleInput(raw) {
+        if (typeof raw !== 'string') return '';
+        return raw.trim().replace(/^@+/, '').trim();
+      }
+
       function validateUsernameInput(raw) {
         if (typeof raw !== 'string') {
           return { valid: false, error: 'Please enter a username.' };
         }
-        const trimmed = raw.trim();
+        const trimmed = normalizeHandleInput(raw);
         if (trimmed.length < 3 || trimmed.length > 20) {
           return { valid: false, error: 'Username must be 3 to 20 characters long.' };
         }
@@ -1893,6 +1898,65 @@
           };
         }
         return { valid: true, username: trimmed };
+      }
+
+      function mergeOnlineUsersList(existingList, incomingList, myUsername) {
+        const myLower = (myUsername || '').toLowerCase();
+        const byLower = new Map();
+        if (Array.isArray(existingList)) {
+          for (const u of existingList) {
+            if (u && typeof u.username === 'string') {
+              const l = u.username.toLowerCase();
+              if (l !== myLower) byLower.set(l, u);
+            }
+          }
+        }
+        if (Array.isArray(incomingList)) {
+          for (const u of incomingList) {
+            if (u && typeof u.username === 'string') {
+              const l = u.username.toLowerCase();
+              if (l !== myLower) byLower.set(l, u);
+            }
+          }
+        }
+        return Array.from(byLower.values()).sort((a, b) => a.username.localeCompare(b.username));
+      }
+
+      function getFilteredOnlineUsers(users, rawQuery) {
+        const cleanQuery = normalizeHandleInput(rawQuery).toLowerCase();
+        const normQuery = cleanQuery.replace(/[\s_-]+/g, '');
+        if (!cleanQuery) {
+          return users.map((u) => ({ user: u, exact: false }));
+        }
+
+        const scored = [];
+        for (const u of users) {
+          if (!u || typeof u.username !== 'string') continue;
+          const lower = u.username.toLowerCase();
+          const normLower = lower.replace(/_/g, '');
+          let score = -1;
+
+          if (lower === cleanQuery || (normQuery && normLower === normQuery)) {
+            score = 0;
+          } else if (/^\d{4}$/.test(cleanQuery) && lower === `guest_${cleanQuery}`) {
+            score = 0;
+          } else if (lower.startsWith(cleanQuery) || (normQuery && normLower.startsWith(normQuery))) {
+            score = 1;
+          } else if (lower.includes(cleanQuery) || (normQuery && normLower.includes(normQuery))) {
+            score = 2;
+          }
+
+          if (score !== -1) {
+            scored.push({
+              score,
+              exact: score === 0,
+              user: u
+            });
+          }
+        }
+
+        scored.sort((a, b) => a.score - b.score || a.user.username.localeCompare(b.user.username));
+        return scored;
       }
 
       function sanitizeFileName(name) {
@@ -2391,6 +2455,8 @@
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               connId: state.connId,
+              username: state.myUsername || undefined,
+              clientToken: state.clientToken,
               messages: batch
             }),
             cache: 'no-store'
@@ -2405,6 +2471,19 @@
           state.connected = true;
           state.reconnecting = false;
           updateConnectionStatusUI('connected', 'Connected');
+
+          if (Array.isArray(data.onlineUsers)) {
+            const prevKey = state.onlineUsers.map((u) => u.username).join(',');
+            const nextKey = data.onlineUsers.map((u) => u.username).join(',');
+            const nextTotal = Number(data.totalOnline) || data.onlineUsers.length + 1;
+            if (prevKey !== nextKey || state.totalOnline !== nextTotal) {
+              state.onlineUsers = data.onlineUsers;
+              state.totalOnline = nextTotal;
+              if (state.myUsername) {
+                renderSidebar();
+              }
+            }
+          }
 
           if (Array.isArray(data.events)) {
             for (const ev of data.events) {
@@ -2426,6 +2505,42 @@
         }
       }
 
+      let searchFetchController = null;
+      async function fetchFastDirectorySearch(queryText = '') {
+        try {
+          if (searchFetchController) {
+            searchFetchController.abort();
+          }
+          searchFetchController = new AbortController();
+          const params = new URLSearchParams({
+            q: queryText,
+            exclude: state.myUsername || ''
+          });
+          const res = await fetch(`/api/users?${params.toString()}`, {
+            method: 'GET',
+            cache: 'no-store',
+            signal: searchFetchController.signal
+          });
+          if (!res.ok) return;
+          const data = await res.json();
+          if (Array.isArray(data.allUsers)) {
+            state.onlineUsers = data.allUsers;
+          } else if (Array.isArray(data.users)) {
+            state.onlineUsers = mergeOnlineUsersList(
+              state.onlineUsers,
+              data.users,
+              state.myUsername
+            );
+          }
+          if (data.totalOnline !== undefined) {
+            state.totalOnline = Math.max(1, Number(data.totalOnline) || 1);
+          }
+          renderSidebar();
+        } catch {
+          // Ignore aborted or transient fetch errors
+        }
+      }
+
       function ensureHttpPollLoop() {
         if (state.httpPollTimer) return;
         state.httpPollTimer = setInterval(() => {
@@ -2437,10 +2552,16 @@
       }
 
       function sendWs(payload) {
-        const enriched =
-          payload && payload.type === 'register'
-            ? { ...payload, clientToken: state.clientToken }
-            : payload;
+        let enriched = payload;
+        if (payload && payload.type === 'register') {
+          enriched = { ...payload, clientToken: state.clientToken };
+        } else if (payload && state.myUsername) {
+          enriched = {
+            ...payload,
+            _user: state.myUsername,
+            _token: state.clientToken
+          };
+        }
 
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           try {
@@ -2599,11 +2720,20 @@
           }
 
           case 'search_results': {
-            if (typeof msg.query === 'string' && msg.query === state.searchQuery) {
-              state.onlineUsers = Array.isArray(msg.users) ? msg.users : [];
-              renderDirectoryList();
-              renderInteriorHomePage();
+            if (Array.isArray(msg.allUsers)) {
+              state.onlineUsers = msg.allUsers;
+            } else if (Array.isArray(msg.users)) {
+              state.onlineUsers = mergeOnlineUsersList(
+                state.onlineUsers,
+                msg.users,
+                state.myUsername
+              );
             }
+            if (msg.totalOnline !== undefined) {
+              state.totalOnline = Math.max(1, Number(msg.totalOnline) || 1);
+            }
+            renderDirectoryList();
+            renderInteriorHomePage();
             break;
           }
 
@@ -3674,20 +3804,66 @@
       }
 
       function renderDirectoryList() {
-        const q = state.searchQuery.trim().toLowerCase();
-        els.directoryHeading.textContent = q ? `Search Results` : `Online Directory`;
+        const rawQuery = state.searchQuery.trim();
+        const cleanHandle = normalizeHandleInput(rawQuery);
+        els.directoryHeading.textContent = cleanHandle ? `Search Results` : `Online Directory`;
 
-        const filtered = state.onlineUsers.filter((u) =>
-          !q ? true : u.username.toLowerCase().includes(q)
-        );
-        els.directoryCount.textContent = String(filtered.length);
+        const scoredMatches = getFilteredOnlineUsers(state.onlineUsers, rawQuery);
+        els.directoryCount.textContent = String(scoredMatches.length);
 
-        if (filtered.length === 0) {
+        // Determine if user typed a valid handle or 4-digit Guest ID that can be directly connected
+        let directCandidate = '';
+        if (/^\d{4}$/.test(cleanHandle)) {
+          directCandidate = `Guest_${cleanHandle}`;
+        } else {
+          const check = validateUsernameInput(cleanHandle);
+          if (check.valid) {
+            directCandidate = check.username;
+          }
+        }
+        const isSelfCandidate =
+          directCandidate &&
+          state.myUsername &&
+          directCandidate.toLowerCase() === state.myUsername.toLowerCase();
+        const alreadyInMatches =
+          directCandidate &&
+          scoredMatches.some((m) => m.user.username.toLowerCase() === directCandidate.toLowerCase());
+
+        const directConnectCardHtml =
+          directCandidate && !isSelfCandidate && !alreadyInMatches
+            ? `
+              <div class="user-row-card" style="border-color: var(--indigo);">
+                <div class="user-row-left">
+                  <div class="avatar-badge" style="background-color: var(--indigo);">${escapeHtml(directCandidate.slice(0, 2).toUpperCase())}</div>
+                  <div class="user-row-meta">
+                    <span class="user-row-name">@${escapeHtml(directCandidate)}</span>
+                    <span class="user-row-sub">Direct handle lookup · Press Enter or Connect</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  class="btn btn-primary btn-compact"
+                  data-action="request-chat"
+                  data-username="${escapeHtml(directCandidate)}"
+                  aria-label="Request chat with ${escapeHtml(directCandidate)}"
+                >
+                  Connect
+                </button>
+              </div>
+            `
+            : '';
+
+        if (scoredMatches.length === 0) {
           els.directoryList.innerHTML = `
+            ${directConnectCardHtml}
             <div class="empty-list-box">
               ${
-                q
-                  ? `No online users matching "${escapeHtml(state.searchQuery)}".`
+                cleanHandle
+                  ? `No online users in directory matching "${escapeHtml(rawQuery)}".${
+                      directConnectCardHtml
+                        ? ' Click "Connect" above to send a direct request.'
+                        : ''
+                    }`
                   : 'No other users online right now. Open Fast Talk in another tab or window to test live 1-to-1 chat.'
               }
             </div>
@@ -3695,8 +3871,8 @@
           return;
         }
 
-        els.directoryList.innerHTML = filtered
-          .map((user) => {
+        const rowsHtml = scoredMatches
+          .map(({ user, exact }) => {
             const safeName = escapeHtml(user.username);
             const lower = user.username.toLowerCase();
             const isChatActive = state.chats.has(lower);
@@ -3729,13 +3905,15 @@
               `;
             }
 
+            const statusSub = exact && cleanHandle ? 'Exact match · Online now' : 'Online now';
+
             return `
-              <div class="user-row-card">
+              <div class="user-row-card ${exact && cleanHandle ? 'active-selected' : ''}">
                 <div class="user-row-left">
                   <div class="avatar-badge">${safeName.slice(0, 2).toUpperCase()}</div>
                   <div class="user-row-meta">
                     <span class="user-row-name">@${safeName}</span>
-                    <span class="user-row-sub">Online now</span>
+                    <span class="user-row-sub">${statusSub}</span>
                   </div>
                 </div>
                 ${actionBtnHtml}
@@ -3743,6 +3921,8 @@
             `;
           })
           .join('');
+
+        els.directoryList.innerHTML = rowsHtml + directConnectCardHtml;
       }
 
       function selectActiveChat(lower) {
@@ -4001,6 +4181,24 @@
         }
       });
 
+      els.myUsernameDisplay.style.cursor = 'pointer';
+      els.myUsernameDisplay.title = 'Click to copy your @username';
+      els.myUsernameDisplay.addEventListener('click', async () => {
+        if (!state.myUsername) return;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(`@${state.myUsername}`);
+          }
+        } catch {
+          // ignore
+        }
+        showToast(`Copied @${state.myUsername}`);
+      });
+
+      els.userSearchInput.addEventListener('focus', () => {
+        fetchFastDirectorySearch(state.searchQuery);
+      });
+
       els.userSearchInput.addEventListener('input', () => {
         state.searchQuery = els.userSearchInput.value;
         if (state.searchQuery.length > 0) {
@@ -4010,6 +4208,41 @@
         }
         renderDirectoryList();
         sendWs({ type: 'search_users', query: state.searchQuery });
+        fetchFastDirectorySearch(state.searchQuery);
+      });
+
+      els.userSearchInput.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter') return;
+        e.preventDefault();
+        const rawQuery = state.searchQuery.trim();
+        if (!rawQuery) return;
+
+        const matches = getFilteredOnlineUsers(state.onlineUsers, rawQuery);
+        if (matches.length > 0) {
+          const topUser = matches[0].user.username;
+          const topLower = topUser.toLowerCase();
+          if (state.chats.has(topLower)) {
+            selectActiveChat(topLower);
+          } else if (
+            state.pendingRequests.has(topLower) &&
+            state.pendingRequests.get(topLower).direction === 'incoming'
+          ) {
+            sendWs({ type: 'chat_accept', from: topUser });
+          } else {
+            sendWs({ type: 'chat_request', to: topUser });
+          }
+          return;
+        }
+
+        const cleanHandle = normalizeHandleInput(rawQuery);
+        if (/^\d{4}$/.test(cleanHandle)) {
+          sendWs({ type: 'chat_request', to: `Guest_${cleanHandle}` });
+          return;
+        }
+        const check = validateUsernameInput(cleanHandle);
+        if (check.valid) {
+          sendWs({ type: 'chat_request', to: check.username });
+        }
       });
 
       els.clearSearchBtn.addEventListener('click', () => {
@@ -4018,6 +4251,7 @@
         els.clearSearchBtn.classList.add('hidden');
         renderDirectoryList();
         sendWs({ type: 'search_users', query: '' });
+        fetchFastDirectorySearch('');
       });
 
       function handleDirectoryActionClick(e) {
