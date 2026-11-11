@@ -338,4 +338,75 @@ test('HTTP /api/events fallback transport supports registration, cross-transport
   }
 });
 
+test('Deferred chat_request delivery and mutual Connect button auto-pairing on both sides (@Ggg and @Egg)', async () => {
+  const app = createFastTalkServer({ heartbeatIntervalMs: 60000 });
+  await new Promise<void>((resolve) => app.httpServer.listen(0, '127.0.0.1', () => resolve()));
+  const address = app.httpServer.address();
+  const port = typeof address === 'object' && address ? address.port : 0;
+  const httpUrl = `http://127.0.0.1:${port}/api/events`;
+
+  async function postEvents(connId: string, messages: any[] = [], username?: string, clientToken?: string) {
+    const res = await fetch(httpUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connId, username, clientToken, messages })
+    });
+    assert.equal(res.status, 200);
+    return (await res.json()) as {
+      status: string;
+      connId: string;
+      events: any[];
+      onlineUsers: Array<{ username: string }>;
+      incomingRequests: Array<{ from: string }>;
+      outgoingRequests: Array<{ to: string }>;
+      activePartners: string[];
+    };
+  }
+
+  try {
+    // 1. @Ggg registers and immediately clicks Connect for @Egg BEFORE @Egg has registered
+    const gggRes = await postEvents(
+      'conn_ggg',
+      [
+        { type: 'register', isGuest: false, username: 'Ggg', clientToken: 'tok_ggg_123456' },
+        { type: 'chat_request', to: 'Egg' }
+      ],
+      'Ggg',
+      'tok_ggg_123456'
+    );
+    const reqSent = gggRes.events.find((e) => e.type === 'chat_request_sent');
+    assert.ok(reqSent, 'Should queue deferred chat_request_sent even when @Egg is not online yet');
+    assert.equal(reqSent.to, 'Egg');
+
+    // 2. @Egg registers and clicks Connect for @Ggg (mutual Connect on both sides!)
+    const eggRes = await postEvents(
+      'conn_egg',
+      [
+        { type: 'register', isGuest: false, username: 'Egg', clientToken: 'tok_egg_654321' },
+        { type: 'chat_request', to: 'Ggg' }
+      ],
+      'Egg',
+      'tok_egg_654321'
+    );
+
+    // @Egg should immediately be paired with @Ggg via mutual Connect auto-accept!
+    assert.ok(
+      eggRes.events.some((e) => e.type === 'chat_accepted' && e.partner === 'Ggg'),
+      '@Egg should receive chat_accepted with @Ggg'
+    );
+    assert.ok(eggRes.activePartners.includes('Ggg'), '@Egg activePartners snapshot should include Ggg');
+
+    // 3. @Ggg polls /api/events and receives chat_accepted + activePartners: ['Egg']
+    const gggPoll = await postEvents('conn_ggg', [], 'Ggg', 'tok_ggg_123456');
+    assert.ok(
+      gggPoll.events.some((e) => e.type === 'chat_accepted' && e.partner === 'Egg'),
+      '@Ggg should receive chat_accepted with @Egg'
+    );
+    assert.ok(gggPoll.activePartners.includes('Egg'), '@Ggg activePartners snapshot should include Egg');
+  } finally {
+    await app.close();
+  }
+});
+
+
 

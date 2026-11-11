@@ -23,7 +23,7 @@ const MAX_TEXT_LENGTH = 4000;                  // Max characters in a chat messa
 const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024; // 100 MB max file size
 const CHUNK_SIZE_BYTES = 16 * 1024;            // 16 KB standard chunk size
 const HEARTBEAT_INTERVAL_MS = 15000;           // 15s ping/pong & stale session check
-const HTTP_SESSION_TIMEOUT_MS = 35000;         // 35s timeout for idle HTTP-only clients
+const HTTP_SESSION_TIMEOUT_MS = 30 * 60 * 1000; // 30m session retention for mobile background tabs
 
 // ============================================================================
 // PURE VALIDATION & SANITIZATION HELPERS
@@ -152,6 +152,7 @@ export function createFastTalkServer(options = {}) {
    */
   const usersByLower = new Map();
   const connectionsById = new Map();
+  let eventIdSeq = 0;
 
   function createVirtualConnection(connId, ws = null) {
     const id = connId || crypto.randomUUID();
@@ -160,14 +161,19 @@ export function createFastTalkServer(options = {}) {
       conn = {
         id,
         ws: ws || null,
+        hasHttp: !ws,
         userLower: null,
         lastSeen: Date.now(),
         outbox: [],
-        preAuthLimiter: new SlidingWindowLimiter(35, 10000)
+        preAuthLimiter: new SlidingWindowLimiter(50, 10000)
       };
       connectionsById.set(id, conn);
-    } else if (ws) {
-      conn.ws = ws;
+    } else {
+      if (ws) {
+        conn.ws = ws;
+      } else {
+        conn.hasHttp = true;
+      }
       conn.lastSeen = Date.now();
     }
     return conn;
@@ -181,20 +187,26 @@ export function createFastTalkServer(options = {}) {
 
   /**
    * Delivers a JSON event to a virtual connection (via live WebSocket if open,
-   * otherwise queues in conn.outbox for the HTTP polling fallback).
+   * AND queues in conn.outbox for HTTP polling reconciliation).
    */
   function sendToConn(conn, payload) {
     if (!conn) return;
+    const stamped =
+      payload && typeof payload === 'object' && !payload._eid
+        ? { ...payload, _eid: ++eventIdSeq }
+        : payload;
+
+    let sentViaWs = false;
     if (conn.ws && conn.ws.readyState === WebSocket.OPEN) {
       try {
-        conn.ws.send(JSON.stringify(payload));
-        return;
+        conn.ws.send(JSON.stringify(stamped));
+        sentViaWs = true;
       } catch {
         // Fall through to outbox queue if WS write fails
       }
     }
-    if (conn.outbox.length < 2500) {
-      conn.outbox.push(payload);
+    if ((!sentViaWs || conn.hasHttp) && conn.outbox.length < 2500) {
+      conn.outbox.push(stamped);
     }
   }
 
@@ -290,6 +302,49 @@ export function createFastTalkServer(options = {}) {
     }
   }
 
+  function syncDeferredRequestsForSession(session) {
+    if (!session) return;
+    const myLower = session.lower;
+    const now = Date.now();
+
+    for (const [otherLower, otherSession] of usersByLower.entries()) {
+      if (otherLower === myLower) continue;
+
+      if (otherSession.outgoingRequests.has(myLower)) {
+        // If both users already requested each other, auto-pair them into an active chat!
+        if (session.outgoingRequests.has(otherLower)) {
+          otherSession.outgoingRequests.delete(myLower);
+          session.outgoingRequests.delete(otherLower);
+          otherSession.incomingRequests.delete(myLower);
+          session.incomingRequests.delete(otherLower);
+
+          otherSession.activePartners.add(myLower);
+          session.activePartners.add(otherLower);
+
+          sendToConn(otherSession.conn, {
+            type: 'chat_accepted',
+            partner: session.username,
+            initiator: true,
+            timestamp: now
+          });
+          sendToConn(session.conn, {
+            type: 'chat_accepted',
+            partner: otherSession.username,
+            initiator: false,
+            timestamp: now
+          });
+        } else if (!session.activePartners.has(otherLower)) {
+          session.incomingRequests.add(otherLower);
+          sendToConn(session.conn, {
+            type: 'chat_request',
+            from: otherSession.username,
+            timestamp: now
+          });
+        }
+      }
+    }
+  }
+
   function ensureSessionBound(conn, rawUsername, rawClientToken) {
     if (!conn) return null;
     if (conn.userLower && usersByLower.has(conn.userLower)) {
@@ -297,6 +352,7 @@ export function createFastTalkServer(options = {}) {
       if (active) {
         active.conn = conn;
         conn.lastSeen = Date.now();
+        syncDeferredRequestsForSession(active);
         return active;
       }
     }
@@ -326,6 +382,7 @@ export function createFastTalkServer(options = {}) {
         if (clientToken) existing.clientToken = clientToken;
         conn.userLower = lower;
         conn.lastSeen = Date.now();
+        syncDeferredRequestsForSession(existing);
         return existing;
       }
       return null;
@@ -342,12 +399,13 @@ export function createFastTalkServer(options = {}) {
       activePartners: new Set(),
       incomingRequests: new Set(),
       outgoingRequests: new Set(),
-      controlLimiter: new SlidingWindowLimiter(80, 10000),
+      controlLimiter: new SlidingWindowLimiter(120, 10000),
       chunkLimiter: new SlidingWindowLimiter(1400, 5000)
     };
     usersByLower.set(lower, restored);
     conn.userLower = lower;
     conn.lastSeen = Date.now();
+    syncDeferredRequestsForSession(restored);
     broadcastDirectoryUpdate();
     return restored;
   }
@@ -520,6 +578,7 @@ export function createFastTalkServer(options = {}) {
           users: searchOnlineUsers(lower, ''),
           totalOnline: usersByLower.size
         });
+        syncDeferredRequestsForSession(existing);
         return;
       }
 
@@ -550,7 +609,7 @@ export function createFastTalkServer(options = {}) {
         activePartners: new Set(),
         incomingRequests: new Set(),
         outgoingRequests: new Set(),
-        controlLimiter: new SlidingWindowLimiter(80, 10000),
+        controlLimiter: new SlidingWindowLimiter(120, 10000),
         chunkLimiter: new SlidingWindowLimiter(1400, 5000)
       };
 
@@ -565,6 +624,7 @@ export function createFastTalkServer(options = {}) {
         totalOnline: usersByLower.size
       });
 
+      syncDeferredRequestsForSession(session);
       broadcastDirectoryUpdate();
       return;
     }
@@ -665,11 +725,23 @@ export function createFastTalkServer(options = {}) {
         return;
       }
 
-      if (!targetSession || !isConnectionActive(targetSession.conn)) {
-        sendToConn(conn, {
-          type: 'error',
-          code: 'USER_OFFLINE',
-          message: `User "@${targetRaw}" is not currently online.`
+      // If target is not online yet, queue the outgoing request so it auto-delivers when target comes online
+      if (!targetSession) {
+        const validCheck = validateUsername(targetRaw);
+        if (!validCheck.valid) {
+          sendToConn(conn, {
+            type: 'error',
+            code: 'INVALID_TARGET',
+            message: validCheck.error
+          });
+          return;
+        }
+        currentSession.outgoingRequests.add(targetLower);
+        sendToConn(currentSession.conn, {
+          type: 'chat_request_sent',
+          to: validCheck.username,
+          deferred: true,
+          timestamp: Date.now()
         });
         return;
       }
@@ -684,9 +756,16 @@ export function createFastTalkServer(options = {}) {
         return;
       }
 
-      if (currentSession.incomingRequests.has(targetLower)) {
+      // If target already requested us (or mutual Connect clicked on both sides), immediately pair & accept!
+      if (
+        currentSession.incomingRequests.has(targetLower) ||
+        targetSession.outgoingRequests.has(currentSession.lower)
+      ) {
         currentSession.incomingRequests.delete(targetLower);
+        currentSession.outgoingRequests.delete(targetLower);
         targetSession.outgoingRequests.delete(currentSession.lower);
+        targetSession.incomingRequests.delete(currentSession.lower);
+
         currentSession.activePartners.add(targetLower);
         targetSession.activePartners.add(currentSession.lower);
 
@@ -743,7 +822,7 @@ export function createFastTalkServer(options = {}) {
       const requesterSession = resolveOnlineUserSession(requesterRaw, currentSession.lower);
       const requesterLower = requesterSession ? requesterSession.lower : requesterRaw.toLowerCase();
 
-      if (!requesterSession || !isConnectionActive(requesterSession.conn)) {
+      if (!requesterSession) {
         currentSession.incomingRequests.delete(requesterLower);
         sendToConn(conn, {
           type: 'error',
@@ -753,17 +832,10 @@ export function createFastTalkServer(options = {}) {
         return;
       }
 
-      if (!currentSession.incomingRequests.has(requesterLower)) {
-        sendToConn(conn, {
-          type: 'error',
-          code: 'NO_REQUEST',
-          message: 'No pending chat request found from that user.'
-        });
-        return;
-      }
-
       currentSession.incomingRequests.delete(requesterLower);
+      currentSession.outgoingRequests.delete(requesterLower);
       requesterSession.outgoingRequests.delete(currentSession.lower);
+      requesterSession.incomingRequests.delete(currentSession.lower);
 
       currentSession.activePartners.add(requesterLower);
       requesterSession.activePartners.add(currentSession.lower);
@@ -1107,7 +1179,23 @@ export function createFastTalkServer(options = {}) {
         }
 
         const events = conn.outbox.splice(0, conn.outbox.length);
-        const onlineSnapshot = conn.userLower ? searchOnlineUsers(conn.userLower, '') : undefined;
+        const boundSession = conn.userLower ? usersByLower.get(conn.userLower) : null;
+        const onlineSnapshot = boundSession ? searchOnlineUsers(boundSession.lower, '') : undefined;
+        const incomingRequests = boundSession
+          ? Array.from(boundSession.incomingRequests).map(
+              (l) => usersByLower.get(l)?.username || l
+            )
+          : undefined;
+        const outgoingRequests = boundSession
+          ? Array.from(boundSession.outgoingRequests).map(
+              (l) => usersByLower.get(l)?.username || l
+            )
+          : undefined;
+        const activePartners = boundSession
+          ? Array.from(boundSession.activePartners).map(
+              (l) => usersByLower.get(l)?.username || l
+            )
+          : undefined;
 
         res.writeHead(200, {
           ...SECURITY_HEADERS,
@@ -1119,6 +1207,9 @@ export function createFastTalkServer(options = {}) {
             connId: conn.id,
             events,
             onlineUsers: onlineSnapshot,
+            incomingRequests,
+            outgoingRequests,
+            activePartners,
             totalOnline: usersByLower.size
           })
         );
@@ -1166,22 +1257,10 @@ export function createFastTalkServer(options = {}) {
     const lower = conn.userLower;
     const session = usersByLower.get(lower);
 
-    // If this is a dual-transport browser session (with clientToken), give HTTP fallback / WS reconnect a 4.5s grace window
+    // Browser sessions (with clientToken) stay active across mobile tab switches & backgrounding!
     if (session && session.clientToken) {
+      conn.hasHttp = true;
       conn.lastSeen = Date.now();
-      const disconnectTime = conn.lastSeen;
-      const timer = setTimeout(() => {
-        const current = usersByLower.get(lower);
-        if (!current) return;
-        const activeWs = current.conn && current.conn.ws && current.conn.ws.readyState === WebSocket.OPEN;
-        const polledSinceDisconnect = current.conn && current.conn.lastSeen > disconnectTime;
-        if (!activeWs && !polledSinceDisconnect) {
-          current.conn.userLower = null;
-          cleanupUserSession(lower, reason);
-          connectionsById.delete(conn.id);
-        }
-      }, 4500);
-      timer.unref?.();
       return;
     }
 
@@ -1193,9 +1272,15 @@ export function createFastTalkServer(options = {}) {
   // ==========================================================================
   // WEBSOCKET CONNECTION HANDLER
   // ==========================================================================
-  wss.on('connection', (ws) => {
+  wss.on('connection', (ws, req) => {
     ws.isAlive = true;
-    const conn = createVirtualConnection(crypto.randomUUID(), ws);
+    const reqUrl = new URL(req?.url || '/', 'http://localhost');
+    const queryConnId = reqUrl.searchParams.get('connId');
+    const connId =
+      typeof queryConnId === 'string' && queryConnId.length >= 6 && queryConnId.length <= 80
+        ? queryConnId
+        : crypto.randomUUID();
+    const conn = createVirtualConnection(connId, ws);
     ws.conn = conn;
 
     ws.on('pong', () => {
@@ -1246,12 +1331,9 @@ export function createFastTalkServer(options = {}) {
     for (const ws of wss.clients) {
       if (ws.isAlive === false) {
         const conn = ws.conn;
-        if (conn && conn.userLower) {
-          const lower = conn.userLower;
-          conn.userLower = null;
-          cleanupUserSession(lower, 'heartbeat_timeout');
+        if (conn) {
+          handleWsDisconnect(conn, 'heartbeat_timeout');
         }
-        if (conn) connectionsById.delete(conn.id);
         ws.terminate();
         continue;
       }
@@ -1263,7 +1345,7 @@ export function createFastTalkServer(options = {}) {
       }
     }
 
-    // Reap idle HTTP-only sessions
+    // Reap expired sessions after 30 minutes of total inactivity
     for (const [id, conn] of connectionsById.entries()) {
       if (!conn.ws && now - conn.lastSeen > HTTP_SESSION_TIMEOUT_MS) {
         if (conn.userLower) {

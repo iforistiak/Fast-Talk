@@ -1825,6 +1825,7 @@
 
         pendingRequests: new Map(),
         chats: new Map(),
+        seenEventIds: new Set(),
 
         activePartnerLower: null,
         myTypingTimer: null,
@@ -2394,8 +2395,8 @@
       }
 
       /**
-       * Local BroadcastChannel fallback only if both WebSocket and /api/events HTTP
-       * server endpoints are unreachable (e.g., static file preview).
+       * Local BroadcastChannel bus for instant 0ms same-browser tab discovery & signaling
+       * alongside WebSocket and HTTP /api/events server transports.
        */
       function initLocalFallbackBus() {
         if (state.localBus || typeof BroadcastChannel === 'undefined') return;
@@ -2406,12 +2407,51 @@
             const data = ev.data;
             if (!data || !state.myUsername) return;
             const myLower = state.myUsername.toLowerCase();
-            if (data.toLower && data.toLower !== myLower) return;
             if (data.fromLower && data.fromLower === myLower) return;
+
+            if (data.type === 'peer_announce' && data.username) {
+              state.onlineUsers = mergeOnlineUsersList(
+                state.onlineUsers,
+                [{ username: data.username, joinedAt: data.joinedAt || Date.now() }],
+                state.myUsername
+              );
+              state.totalOnline = Math.max(state.totalOnline, state.onlineUsers.length + 1);
+              renderSidebar();
+              if (data.reply) {
+                try {
+                  bus.postMessage({
+                    type: 'peer_announce',
+                    fromLower: myLower,
+                    username: state.myUsername,
+                    joinedAt: Date.now(),
+                    reply: false
+                  });
+                } catch {
+                  // ignore
+                }
+              }
+              return;
+            }
+
+            if (data.toLower && data.toLower !== myLower) return;
             if (data.serverEvent) {
               handleServerMessage(data.serverEvent);
             }
           };
+        } catch {
+          // ignore
+        }
+      }
+
+      function broadcastLocalPeerEvent(toUsername, serverEvent) {
+        initLocalFallbackBus();
+        if (!state.localBus || !state.myUsername) return;
+        try {
+          state.localBus.postMessage({
+            fromLower: state.myUsername.toLowerCase(),
+            toLower: toUsername ? toUsername.toLowerCase() : undefined,
+            serverEvent
+          });
         } catch {
           // ignore
         }
@@ -2440,11 +2480,79 @@
         }
       }
 
+      function reconcileServerSnapshot(data) {
+        if (!data || !state.myUsername) return;
+        let sidebarDirty = false;
+
+        if (Array.isArray(data.onlineUsers)) {
+          const prevKey = state.onlineUsers.map((u) => u.username).join(',');
+          const nextKey = data.onlineUsers.map((u) => u.username).join(',');
+          const nextTotal = Number(data.totalOnline) || data.onlineUsers.length + 1;
+          if (prevKey !== nextKey || state.totalOnline !== nextTotal) {
+            state.onlineUsers = data.onlineUsers;
+            state.totalOnline = nextTotal;
+            sidebarDirty = true;
+          }
+        }
+
+        if (Array.isArray(data.activePartners)) {
+          for (const partner of data.activePartners) {
+            if (!partner || typeof partner !== 'string') continue;
+            const lower = partner.toLowerCase();
+            if (!state.chats.has(lower)) {
+              handleServerMessage({
+                type: 'chat_accepted',
+                partner,
+                initiator: false,
+                timestamp: Date.now()
+              });
+              sidebarDirty = true;
+            }
+          }
+        }
+
+        if (Array.isArray(data.incomingRequests)) {
+          for (const req of data.incomingRequests) {
+            if (!req || typeof req.from !== 'string') continue;
+            const lower = req.from.toLowerCase();
+            if (state.chats.has(lower)) continue;
+            const existing = state.pendingRequests.get(lower);
+            if (!existing || existing.direction !== 'incoming') {
+              state.pendingRequests.set(lower, {
+                username: req.from,
+                direction: 'incoming',
+                timestamp: req.timestamp || Date.now()
+              });
+              triggerNotificationPop('request', lower);
+              showToast(`Incoming chat request from @${req.from}`);
+              sidebarDirty = true;
+            }
+          }
+        }
+
+        if (Array.isArray(data.outgoingRequests)) {
+          for (const req of data.outgoingRequests) {
+            if (!req || typeof req.to !== 'string') continue;
+            const lower = req.to.toLowerCase();
+            if (state.chats.has(lower)) continue;
+            if (!state.pendingRequests.has(lower)) {
+              state.pendingRequests.set(lower, {
+                username: req.to,
+                direction: 'outgoing',
+                timestamp: req.timestamp || Date.now()
+              });
+              sidebarDirty = true;
+            }
+          }
+        }
+
+        if (sidebarDirty) {
+          renderSidebar();
+        }
+      }
+
       async function flushHttpTransport() {
         if (state.intentionalLogout) return;
-        if (state.ws && state.ws.readyState === WebSocket.OPEN && state.httpOutbox.length === 0) {
-          return;
-        }
         if (state.httpFlushInFlight) return;
         state.httpFlushInFlight = true;
 
@@ -2472,24 +2580,13 @@
           state.reconnecting = false;
           updateConnectionStatusUI('connected', 'Connected');
 
-          if (Array.isArray(data.onlineUsers)) {
-            const prevKey = state.onlineUsers.map((u) => u.username).join(',');
-            const nextKey = data.onlineUsers.map((u) => u.username).join(',');
-            const nextTotal = Number(data.totalOnline) || data.onlineUsers.length + 1;
-            if (prevKey !== nextKey || state.totalOnline !== nextTotal) {
-              state.onlineUsers = data.onlineUsers;
-              state.totalOnline = nextTotal;
-              if (state.myUsername) {
-                renderSidebar();
-              }
-            }
-          }
-
           if (Array.isArray(data.events)) {
             for (const ev of data.events) {
               handleServerMessage(ev);
             }
           }
+
+          reconcileServerSnapshot(data);
         } catch {
           // If server HTTP endpoint is unreachable and we had outgoing messages, use local fallback
           if (!state.connected && batch.length > 0) {
@@ -2545,10 +2642,8 @@
         if (state.httpPollTimer) return;
         state.httpPollTimer = setInterval(() => {
           if (state.intentionalLogout) return;
-          if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-            flushHttpTransport();
-          }
-        }, 600);
+          flushHttpTransport();
+        }, 750);
       }
 
       function sendWs(payload) {
@@ -2563,25 +2658,95 @@
           };
         }
 
-        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-          try {
-            state.ws.send(JSON.stringify(enriched));
-            return true;
-          } catch {
-            // Fall through to HTTP transport if WebSocket send throws
+        // Also mirror critical peer signaling onto local BroadcastChannel for instant 0ms same-browser tabs
+        if (payload && state.myUsername) {
+          if (payload.type === 'chat_request' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'chat_request',
+              from: state.myUsername,
+              timestamp: Date.now()
+            });
+          } else if (payload.type === 'chat_accept' && payload.from) {
+            broadcastLocalPeerEvent(payload.from, {
+              type: 'chat_accepted',
+              partner: state.myUsername,
+              initiator: true,
+              timestamp: Date.now()
+            });
+          } else if (payload.type === 'chat_decline' && payload.from) {
+            broadcastLocalPeerEvent(payload.from, {
+              type: 'chat_declined',
+              from: state.myUsername,
+              timestamp: Date.now()
+            });
+          } else if (payload.type === 'chat_request_cancel' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'chat_request_cancelled',
+              from: state.myUsername,
+              timestamp: Date.now()
+            });
+          } else if (payload.type === 'chat_message' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'chat_message',
+              id: payload.id,
+              from: state.myUsername,
+              text: payload.text,
+              timestamp: Date.now()
+            });
+          } else if (payload.type === 'typing' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'typing',
+              from: state.myUsername,
+              isTyping: Boolean(payload.isTyping)
+            });
+          } else if (payload.type === 'read_receipt' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'read_receipt',
+              from: state.myUsername,
+              timestamp: Date.now()
+            });
+          } else if (payload.type === 'end_chat' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'chat_wiped',
+              partner: state.myUsername,
+              reason: 'ended_by_partner'
+            });
           }
         }
 
-        state.httpOutbox.push(enriched);
-        ensureHttpPollLoop();
-        flushHttpTransport();
+        let sentViaWs = false;
+        if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+          try {
+            state.ws.send(JSON.stringify(enriched));
+            sentViaWs = true;
+          } catch {
+            sentViaWs = false;
+          }
+        }
+
+        // Always queue idempotent session/connection control events via HTTP /api/events as well
+        // so half-open mobile WebSockets never drop registration or Connect/Accept actions.
+        const isCriticalControl =
+          payload &&
+          (payload.type === 'register' ||
+            payload.type === 'chat_request' ||
+            payload.type === 'chat_accept' ||
+            payload.type === 'chat_decline' ||
+            payload.type === 'chat_request_cancel' ||
+            payload.type === 'end_chat');
+
+        if (!sentViaWs || isCriticalControl) {
+          state.httpOutbox.push(enriched);
+          ensureHttpPollLoop();
+          flushHttpTransport();
+        }
         return true;
       }
 
       function connectWebSocket() {
+        initLocalFallbackBus();
         ensureHttpPollLoop();
 
-        // Immediately verify connectivity via HTTP transport if WS isn't open yet
         if (!state.connected) {
           flushHttpTransport();
         }
@@ -2600,7 +2765,8 @@
 
         let ws;
         try {
-          ws = new WebSocket(WS_SERVER_URL);
+          const sep = WS_SERVER_URL.includes('?') ? '&' : '?';
+          ws = new WebSocket(`${WS_SERVER_URL}${sep}connId=${encodeURIComponent(state.connId)}`);
         } catch {
           flushHttpTransport();
           return;
@@ -2648,7 +2814,6 @@
           state.reconnectAttempts += 1;
           const delay = Math.min(1500 * Math.pow(1.5, state.reconnectAttempts - 1), 8000);
 
-          // Seamlessly keep session alive via HTTP /api/events without blocking UI
           if (state.myUsername && state.httpOutbox.length === 0) {
             state.httpOutbox.push({
               type: 'register',
@@ -2678,12 +2843,29 @@
       // SERVER MESSAGE DISPATCHER
       // ========================================================================
       function handleServerMessage(msg) {
+        if (!msg || typeof msg !== 'object') return;
+        if (msg._eid) {
+          if (state.seenEventIds.has(msg._eid)) return;
+          state.seenEventIds.add(msg._eid);
+          if (state.seenEventIds.size > 2000) {
+            const first = state.seenEventIds.values().next().value;
+            state.seenEventIds.delete(first);
+          }
+        }
+
         switch (msg.type) {
           case 'registered': {
             state.myUsername = msg.username;
             state.desiredRegistration = null;
-            state.onlineUsers = Array.isArray(msg.users) ? msg.users : [];
-            state.totalOnline = Number(msg.totalOnline) || 1;
+            state.onlineUsers = mergeOnlineUsersList(
+              state.onlineUsers,
+              Array.isArray(msg.users) ? msg.users : [],
+              msg.username
+            );
+            state.totalOnline = Math.max(
+              Number(msg.totalOnline) || 1,
+              state.onlineUsers.length + 1
+            );
 
             els.landingError.classList.add('hidden');
             els.landingView.classList.add('hidden');
@@ -2693,6 +2875,22 @@
 
             renderSidebar();
 
+            // Announce presence on local BroadcastChannel so same-browser tabs discover immediately
+            initLocalFallbackBus();
+            if (state.localBus) {
+              try {
+                state.localBus.postMessage({
+                  type: 'peer_announce',
+                  fromLower: state.myUsername.toLowerCase(),
+                  username: state.myUsername,
+                  joinedAt: Date.now(),
+                  reply: true
+                });
+              } catch {
+                // ignore
+              }
+            }
+
             // If user joined via an ?invite=username link, automatically send a chat request
             if (
               state.pendingInviteUser &&
@@ -2700,7 +2898,7 @@
             ) {
               const target = state.pendingInviteUser;
               state.pendingInviteUser = '';
-              sendWs({ type: 'chat_request', to: target });
+              initiateChatRequestWith(target);
             }
             break;
           }
@@ -2738,27 +2936,51 @@
           }
 
           case 'chat_request_sent': {
-            const lower = msg.to.toLowerCase();
+            const lower = (msg.to || '').toLowerCase();
+            if (!lower || state.chats.has(lower)) break;
+            const alreadyOutgoing =
+              state.pendingRequests.has(lower) &&
+              state.pendingRequests.get(lower).direction === 'outgoing';
             state.pendingRequests.set(lower, {
               username: msg.to,
               direction: 'outgoing',
               timestamp: msg.timestamp || Date.now()
             });
             renderSidebar();
-            showToast(`Chat request sent to @${msg.to}`);
+            if (!alreadyOutgoing) {
+              showToast(`Chat request sent to @${msg.to}`);
+            }
             break;
           }
 
           case 'chat_request': {
-            const lower = msg.from.toLowerCase();
+            const lower = (msg.from || '').toLowerCase();
+            if (!lower || state.chats.has(lower)) break;
+
+            // If we already sent an outgoing request to this user, mutual request = auto-accept!
+            const existing = state.pendingRequests.get(lower);
+            if (existing && existing.direction === 'outgoing') {
+              sendWs({ type: 'chat_accept', from: msg.from });
+              handleServerMessage({
+                type: 'chat_accepted',
+                partner: msg.from,
+                initiator: true,
+                timestamp: Date.now()
+              });
+              break;
+            }
+
+            const alreadyIncoming = existing && existing.direction === 'incoming';
             state.pendingRequests.set(lower, {
               username: msg.from,
               direction: 'incoming',
               timestamp: msg.timestamp || Date.now()
             });
-            triggerNotificationPop('request', lower);
             renderSidebar();
-            showToast(`Incoming chat request from @${msg.from}`);
+            if (!alreadyIncoming) {
+              triggerNotificationPop('request', lower);
+              showToast(`Incoming chat request from @${msg.from}`);
+            }
             break;
           }
 
@@ -2774,17 +2996,23 @@
 
           case 'chat_accepted': {
             const partner = msg.partner;
+            if (!partner) break;
             const lower = partner.toLowerCase();
+            const alreadyExisted = state.chats.has(lower);
             state.pendingRequests.delete(lower);
 
             const session = ensureChatSession(partner, Boolean(msg.initiator));
-            appendSystemMessage(
-              session,
-              `Ephemeral 1-to-1 chat established with @${partner}. Messages and files will auto-wipe on close.`
-            );
-
-            selectActiveChat(lower);
-            setupWebRtcForSession(session);
+            if (!alreadyExisted) {
+              appendSystemMessage(
+                session,
+                `Ephemeral 1-to-1 chat established with @${partner}. Messages and files will auto-wipe on close.`
+              );
+              selectActiveChat(lower);
+              setupWebRtcForSession(session);
+              showToast(`Connected with @${partner}`);
+            } else if (!state.activePartnerLower) {
+              selectActiveChat(lower);
+            }
             renderSidebar();
             break;
           }
@@ -2799,9 +3027,17 @@
 
           case 'chat_message': {
             const sender = msg.from;
+            if (!sender) break;
             const lower = sender.toLowerCase();
-            const session = state.chats.get(lower);
-            if (!session) break;
+            let session = state.chats.get(lower);
+            if (!session) {
+              session = ensureChatSession(sender, false);
+              state.pendingRequests.delete(lower);
+            }
+
+            if (msg.id && session.messages.some((m) => m.id === msg.id)) {
+              break;
+            }
 
             session.partnerTyping = false;
             clearTimeout(session.typingTimeout);
@@ -3829,29 +4065,79 @@
           directCandidate &&
           scoredMatches.some((m) => m.user.username.toLowerCase() === directCandidate.toLowerCase());
 
-        const directConnectCardHtml =
-          directCandidate && !isSelfCandidate && !alreadyInMatches
-            ? `
-              <div class="user-row-card" style="border-color: var(--indigo);">
-                <div class="user-row-left">
-                  <div class="avatar-badge" style="background-color: var(--indigo);">${escapeHtml(directCandidate.slice(0, 2).toUpperCase())}</div>
-                  <div class="user-row-meta">
-                    <span class="user-row-name">@${escapeHtml(directCandidate)}</span>
-                    <span class="user-row-sub">Direct handle lookup · Press Enter or Connect</span>
-                  </div>
+        let directConnectCardHtml = '';
+        if (directCandidate && !isSelfCandidate && !alreadyInMatches) {
+          const directLower = directCandidate.toLowerCase();
+          const safeDirect = escapeHtml(directCandidate);
+          const isDirectChatActive = state.chats.has(directLower);
+          const directPending = state.pendingRequests.get(directLower);
+
+          let directBtnHtml = '';
+          let directSubHtml = 'Direct handle lookup · Press Enter or Connect';
+          if (isDirectChatActive) {
+            directSubHtml = 'Active session ready · Click to open chat';
+            directBtnHtml = `
+              <button
+                type="button"
+                class="btn btn-secondary btn-compact"
+                data-action="open-chat"
+                data-lower="${escapeHtml(directLower)}"
+                aria-label="Open chat with ${safeDirect}"
+              >
+                Open Chat
+              </button>
+            `;
+          } else if (directPending && directPending.direction === 'incoming') {
+            directSubHtml = 'Incoming request waiting · Click Accept to start chat';
+            directBtnHtml = `
+              <button
+                type="button"
+                class="btn btn-primary btn-compact"
+                data-action="accept-request"
+                data-username="${safeDirect}"
+                aria-label="Accept request from ${safeDirect}"
+              >
+                Accept
+              </button>
+            `;
+          } else if (directPending && directPending.direction === 'outgoing') {
+            directSubHtml = 'Request sent · Waiting for peer to accept or connect';
+            directBtnHtml = `
+              <button
+                type="button"
+                class="btn btn-secondary btn-compact"
+                disabled
+              >
+                Requested
+              </button>
+            `;
+          } else {
+            directBtnHtml = `
+              <button
+                type="button"
+                class="btn btn-primary btn-compact"
+                data-action="request-chat"
+                data-username="${safeDirect}"
+                aria-label="Request chat with ${safeDirect}"
+              >
+                Connect
+              </button>
+            `;
+          }
+
+          directConnectCardHtml = `
+            <div class="user-row-card" style="border-color: var(--indigo);">
+              <div class="user-row-left">
+                <div class="avatar-badge" style="background-color: var(--indigo);">${escapeHtml(directCandidate.slice(0, 2).toUpperCase())}</div>
+                <div class="user-row-meta">
+                  <span class="user-row-name">@${safeDirect}</span>
+                  <span class="user-row-sub">${directSubHtml}</span>
                 </div>
-                <button
-                  type="button"
-                  class="btn btn-primary btn-compact"
-                  data-action="request-chat"
-                  data-username="${escapeHtml(directCandidate)}"
-                  aria-label="Request chat with ${escapeHtml(directCandidate)}"
-                >
-                  Connect
-                </button>
               </div>
-            `
-            : '';
+              ${directBtnHtml}
+            </div>
+          `;
+        }
 
         if (scoredMatches.length === 0) {
           els.directoryList.innerHTML = `
@@ -3861,7 +4147,7 @@
                 cleanHandle
                   ? `No online users in directory matching "${escapeHtml(rawQuery)}".${
                       directConnectCardHtml
-                        ? ' Click "Connect" above to send a direct request.'
+                        ? ' Use the card above to connect directly with @' + escapeHtml(directCandidate) + '.'
                         : ''
                     }`
                   : 'No other users online right now. Open Fast Talk in another tab or window to test live 1-to-1 chat.'
@@ -4211,6 +4497,37 @@
         fetchFastDirectorySearch(state.searchQuery);
       });
 
+      function initiateChatRequestWith(rawTarget) {
+        const cleanTarget = normalizeHandleInput(rawTarget);
+        if (!cleanTarget) return;
+        const lower = cleanTarget.toLowerCase();
+        if (state.myUsername && lower === state.myUsername.toLowerCase()) {
+          showToast('You cannot start a chat with yourself.');
+          return;
+        }
+
+        if (state.chats.has(lower)) {
+          selectActiveChat(lower);
+          return;
+        }
+
+        const existingReq = state.pendingRequests.get(lower);
+        if (existingReq && existingReq.direction === 'incoming') {
+          sendWs({ type: 'chat_accept', from: existingReq.username || cleanTarget });
+          return;
+        }
+
+        // Optimistically show outgoing request in Pending Requests & update Connect button state immediately
+        state.pendingRequests.set(lower, {
+          username: cleanTarget,
+          direction: 'outgoing',
+          timestamp: Date.now()
+        });
+        renderSidebar();
+        showToast(`Chat request sent to @${cleanTarget}`);
+        sendWs({ type: 'chat_request', to: cleanTarget });
+      }
+
       els.userSearchInput.addEventListener('keydown', (e) => {
         if (e.key !== 'Enter') return;
         e.preventDefault();
@@ -4219,29 +4536,18 @@
 
         const matches = getFilteredOnlineUsers(state.onlineUsers, rawQuery);
         if (matches.length > 0) {
-          const topUser = matches[0].user.username;
-          const topLower = topUser.toLowerCase();
-          if (state.chats.has(topLower)) {
-            selectActiveChat(topLower);
-          } else if (
-            state.pendingRequests.has(topLower) &&
-            state.pendingRequests.get(topLower).direction === 'incoming'
-          ) {
-            sendWs({ type: 'chat_accept', from: topUser });
-          } else {
-            sendWs({ type: 'chat_request', to: topUser });
-          }
+          initiateChatRequestWith(matches[0].user.username);
           return;
         }
 
         const cleanHandle = normalizeHandleInput(rawQuery);
         if (/^\d{4}$/.test(cleanHandle)) {
-          sendWs({ type: 'chat_request', to: `Guest_${cleanHandle}` });
+          initiateChatRequestWith(`Guest_${cleanHandle}`);
           return;
         }
         const check = validateUsernameInput(cleanHandle);
         if (check.valid) {
-          sendWs({ type: 'chat_request', to: check.username });
+          initiateChatRequestWith(check.username);
         }
       });
 
@@ -4262,7 +4568,7 @@
         if (action === 'request-chat') {
           const target = btn.getAttribute('data-username');
           if (target) {
-            sendWs({ type: 'chat_request', to: target });
+            initiateChatRequestWith(target);
           }
         } else if (action === 'accept-request') {
           const from = btn.getAttribute('data-username');
@@ -4468,27 +4774,17 @@
         }, 1800);
       });
 
-      // Ephemeral Rule: Tab Close / Refresh Cleanup
+      // Ephemeral Rule: Tab Close Cleanup (revoke local Blob URLs without logging out on mobile tab switch)
       function handlePageUnload() {
         try {
-          if (state.myUsername) {
-            if (state.ws && state.ws.readyState === WebSocket.OPEN) {
-              state.ws.send(JSON.stringify({ type: 'logout', reason: 'page_unload' }));
-            } else if (navigator.sendBeacon) {
-              const blob = new Blob(
-                [
-                  JSON.stringify({
-                    connId: state.connId,
-                    messages: [{ type: 'logout', reason: 'page_unload' }]
-                  })
-                ],
-                { type: 'application/json' }
-              );
-              navigator.sendBeacon('/api/events', blob);
+          for (const session of state.chats.values()) {
+            for (const url of session.blobUrls) {
+              try {
+                URL.revokeObjectURL(url);
+              } catch {
+                // ignore
+              }
             }
-          }
-          for (const lower of Array.from(state.chats.keys())) {
-            wipeSingleChatSession(lower);
           }
         } catch {
           // ignore unload errors
@@ -4496,7 +4792,19 @@
       }
 
       window.addEventListener('beforeunload', handlePageUnload);
-      window.addEventListener('pagehide', handlePageUnload);
+
+      function handleVisibilityOrFocusResume() {
+        if (state.intentionalLogout) return;
+        if (document.visibilityState && document.visibilityState !== 'visible') return;
+        connectWebSocket();
+        flushHttpTransport();
+        if (state.myUsername) {
+          fetchFastDirectorySearch(state.searchQuery);
+        }
+      }
+
+      document.addEventListener('visibilitychange', handleVisibilityOrFocusResume);
+      window.addEventListener('focus', handleVisibilityOrFocusResume);
 
       connectWebSocket();
 
