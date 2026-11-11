@@ -16,7 +16,10 @@ const __dirname = path.dirname(__filename);
 // ============================================================================
 // CONFIGURATION CONSTANTS
 // ============================================================================
-const DEFAULT_PORT = Number(process.env.PORT) || 3000;
+const DEFAULT_PORT =
+  process.env.PORT && process.env.PORT !== '8080'
+    ? Number(process.env.PORT)
+    : 3000;
 const MAX_WS_PAYLOAD_BYTES = 64 * 1024;        // 64 KB max single WS frame
 const MAX_HTTP_BODY_BYTES = 128 * 1024;        // 128 KB max HTTP batch body
 const MAX_TEXT_LENGTH = 4000;                  // Max characters in a chat message
@@ -1089,12 +1092,18 @@ export function createFastTalkServer(options = {}) {
   const httpServer = http.createServer((req, res) => {
     const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
-    if (req.method === 'GET' && reqUrl.pathname === '/healthz') {
+    if ((req.method === 'GET' || req.method === 'HEAD') && reqUrl.pathname === '/healthz') {
+      const body = JSON.stringify({ status: 'ok' });
       res.writeHead(200, {
         ...SECURITY_HEADERS,
+        'Content-Length': Buffer.byteLength(body, 'utf8'),
         'Content-Type': 'application/json; charset=utf-8'
       });
-      res.end(JSON.stringify({ status: 'ok' }));
+      if (req.method === 'HEAD') {
+        res.end();
+      } else {
+        res.end(body);
+      }
       return;
     }
 
@@ -1217,21 +1226,26 @@ export function createFastTalkServer(options = {}) {
       return;
     }
 
-    if (req.method === 'GET' && (reqUrl.pathname === '/' || reqUrl.pathname === '/index.html')) {
+    if ((req.method === 'GET' || req.method === 'HEAD') && (reqUrl.pathname === '/' || reqUrl.pathname === '/index.html')) {
       fs.readFile(indexHtmlPath, 'utf8', (err, html) => {
         if (err) {
           res.writeHead(500, {
             ...SECURITY_HEADERS,
             'Content-Type': 'text/plain; charset=utf-8'
           });
-          res.end('Internal Server Error');
+          res.end(req.method === 'HEAD' ? undefined : 'Internal Server Error');
           return;
         }
         res.writeHead(200, {
           ...SECURITY_HEADERS,
+          'Content-Length': Buffer.byteLength(html, 'utf8'),
           'Content-Type': 'text/html; charset=utf-8'
         });
-        res.end(html);
+        if (req.method === 'HEAD') {
+          res.end();
+        } else {
+          res.end(html);
+        }
       });
       return;
     }

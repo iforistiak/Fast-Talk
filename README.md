@@ -67,6 +67,13 @@ PORT=3000 npm start
 
 Open `http://localhost:3000` in your browser. To test 1-to-1 chat and QR invite discovery locally, open a second browser window or scan the generated invite QR code.
 
+### 3. Static Hosting (GitHub Pages, Vercel, Netlify)
+
+When deployed on static hosts like **GitHub Pages** (`https://<username>.github.io/<repo>/`):
+- Multi-tier client-side signaling automatically enables local discovery, mutual request auto-pairing, and WebRTC handshakes.
+- For internet-wide cross-device connections on static hosts, configure your Supabase Realtime credentials in `SUPABASE_CONFIG` at the top of `index.html` or directly in the UI via the **Relay** navigation button.
+- Alternatively, deploy `server.js` to any free Node host (such as Render, Railway, or Fly.io) and connect from your static site by entering your `wss://...` URL in the Relay settings modal.
+
 ---
 
 ## License

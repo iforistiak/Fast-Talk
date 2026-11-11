@@ -21,6 +21,7 @@
       href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
     <style>
       /* ==========================================================================
          FAST TALK DESIGN SYSTEM — CORPORATE 4-COLOR PALETTE & DUAL THEME
@@ -1437,6 +1438,15 @@
               </button>
               <button
                 type="button"
+                id="relay-nav-btn"
+                class="btn btn-header-dark"
+                aria-label="Configure signaling and relay settings"
+                title="Signaling & Network Settings"
+              >
+                Relay
+              </button>
+              <button
+                type="button"
                 id="workspace-theme-btn"
                 class="btn btn-header-dark"
                 aria-label="Toggle color theme"
@@ -1709,6 +1719,67 @@
           </div>
         </div>
       </div>
+
+      <!-- ====================================================================
+           5. RELAY & SIGNALING SETTINGS MODAL
+           ==================================================================== -->
+      <div
+        id="relay-modal"
+        class="modal-backdrop hidden"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="relay-modal-title"
+      >
+        <div class="modal-card">
+          <h3 id="relay-modal-title" class="modal-title">Signaling &amp; Network Relay</h3>
+          <p class="modal-body">
+            Fast Talk uses WebRTC P2P for direct data transfer with multi-tier signaling. You can connect via a local/remote WebSocket server or configure Supabase Realtime for serverless static hosting (e.g. GitHub Pages).
+          </p>
+          <div style="display: flex; flex-direction: column; gap: 12px; margin: 14px 0 16px;">
+            <div>
+              <label for="cfg-custom-ws" style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--text-body);">
+                Custom WebSocket Signaling URL (optional)
+              </label>
+              <input
+                type="text"
+                id="cfg-custom-ws"
+                class="input-field"
+                placeholder="wss://your-backend.onrender.com or leave empty"
+              />
+            </div>
+            <div>
+              <label for="cfg-supabase-url" style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--text-body);">
+                Supabase Project URL (for GitHub Pages / static host)
+              </label>
+              <input
+                type="text"
+                id="cfg-supabase-url"
+                class="input-field"
+                placeholder="https://your-project.supabase.co"
+              />
+            </div>
+            <div>
+              <label for="cfg-supabase-key" style="display: block; font-size: 12px; font-weight: 600; margin-bottom: 4px; color: var(--text-body);">
+                Supabase Anon / Public Key
+              </label>
+              <input
+                type="text"
+                id="cfg-supabase-key"
+                class="input-field"
+                placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+              />
+            </div>
+          </div>
+          <div class="modal-actions">
+            <button type="button" id="close-relay-modal-btn" class="btn btn-secondary">
+              Cancel
+            </button>
+            <button type="button" id="save-relay-modal-btn" class="btn btn-primary">
+              Save &amp; Connect
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
 
     <script>
@@ -1722,8 +1793,28 @@
          * Licensed under the MIT License
          * ======================================================================
          */
+        const IS_STATIC_HOST =
+          window.location.protocol === 'file:' ||
+          window.location.hostname.endsWith('github.io') ||
+          window.location.hostname.endsWith('pages.dev') ||
+          window.location.hostname.endsWith('vercel.app') ||
+          window.location.hostname.endsWith('netlify.app');
+
         const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const WS_SERVER_URL = `${WS_PROTOCOL}//${window.location.host}`;
+        const WS_SERVER_URL = IS_STATIC_HOST ? '' : `${WS_PROTOCOL}//${window.location.host}`;
+
+        /**
+         * SUPABASE REALTIME CONFIGURATION (Presence + Broadcast)
+         * Required for static deployments like GitHub Pages (https://iforistiak.github.io/Fast-Talk/)
+         * Keep URL/key as constants at top of file.
+         */
+        const SUPABASE_CONFIG = {
+          url: window.FAST_TALK_SUPABASE_URL || 'https://xkmukvjfqfczjgybhyra.supabase.co',
+          anonKey:
+            window.FAST_TALK_SUPABASE_KEY ||
+            'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.sample_anon_key',
+          channel: 'fast_talk_global'
+        };
 
         const MAX_FILE_SIZE_BYTES = 100 * 1024 * 1024;
         const CHUNK_SIZE_BYTES = 16 * 1024;
@@ -1807,6 +1898,13 @@
         httpFlushInFlight: false,
         httpPollTimer: null,
         localBus: null,
+        storageListenerBound: false,
+        supabaseChannel: null,
+        supabaseClient: null,
+        customWsServer: '',
+        supabaseUrl: '',
+        supabaseKey: '',
+        peerHeartbeatTimer: null,
         reconnecting: false,
         reconnectAttempts: 0,
         reconnectTimer: null,
@@ -2100,7 +2198,15 @@
         inviteQrBox: document.getElementById('invite-qr-box'),
         inviteLinkInput: document.getElementById('invite-link-input'),
         copyInviteBtn: document.getElementById('copy-invite-btn'),
-        closeInviteModalBtn: document.getElementById('close-invite-modal-btn')
+        closeInviteModalBtn: document.getElementById('close-invite-modal-btn'),
+
+        relayNavBtn: document.getElementById('relay-nav-btn'),
+        relayModal: document.getElementById('relay-modal'),
+        closeRelayModalBtn: document.getElementById('close-relay-modal-btn'),
+        saveRelayModalBtn: document.getElementById('save-relay-modal-btn'),
+        cfgCustomWs: document.getElementById('cfg-custom-ws'),
+        cfgSupabaseUrl: document.getElementById('cfg-supabase-url'),
+        cfgSupabaseKey: document.getElementById('cfg-supabase-key')
       };
 
       // ========================================================================
@@ -2395,65 +2501,207 @@
       }
 
       /**
-       * Local BroadcastChannel bus for instant 0ms same-browser tab discovery & signaling
-       * alongside WebSocket and HTTP /api/events server transports.
+       * Multi-tier signaling engine:
+       * 1. Local Node server (WebSocket + HTTP /api/events) when hosted with server.js
+       * 2. Supabase Realtime (Presence + Broadcast) for static hosts like GitHub Pages
+       * 3. BroadcastChannel + Storage pulse mesh for instant zero-latency same-device tabs
        */
-      function initLocalFallbackBus() {
-        if (state.localBus || typeof BroadcastChannel === 'undefined') return;
-        try {
-          const bus = new BroadcastChannel('fast_talk_ephemeral_bus');
-          state.localBus = bus;
-          bus.onmessage = (ev) => {
-            const data = ev.data;
-            if (!data || !state.myUsername) return;
-            const myLower = state.myUsername.toLowerCase();
-            if (data.fromLower && data.fromLower === myLower) return;
+      function ensurePeerHeartbeat() {
+        if (state.peerHeartbeatTimer) return;
+        state.peerHeartbeatTimer = setInterval(() => {
+          if (state.myUsername && !state.intentionalLogout) {
+            broadcastPeerAnnounce(false);
+          }
+        }, 2500);
+      }
 
-            if (data.type === 'peer_announce' && data.username) {
+      function handleIncomingBusMessage(data) {
+        if (!data || !state.myUsername) return;
+        const myLower = state.myUsername.toLowerCase();
+        if (data.fromLower && data.fromLower === myLower) return;
+
+        if (data.type === 'peer_announce' && data.username) {
+          state.onlineUsers = mergeOnlineUsersList(
+            state.onlineUsers,
+            [{ username: data.username, joinedAt: data.joinedAt || Date.now() }],
+            state.myUsername
+          );
+          state.totalOnline = Math.max(state.totalOnline, state.onlineUsers.length + 1);
+          renderSidebar();
+          if (data.reply) {
+            broadcastPeerAnnounce(false);
+          }
+          return;
+        }
+
+        if (data.toLower && data.toLower !== myLower) return;
+        if (data.serverEvent) {
+          handleServerMessage(data.serverEvent);
+        }
+      }
+
+      function initLocalFallbackBus() {
+        if (!state.localBus && typeof BroadcastChannel !== 'undefined') {
+          try {
+            const bus = new BroadcastChannel('fast_talk_ephemeral_bus');
+            state.localBus = bus;
+            bus.onmessage = (ev) => handleIncomingBusMessage(ev.data);
+          } catch {
+            // ignore
+          }
+        }
+
+        if (!state.storageListenerBound && typeof window !== 'undefined') {
+          state.storageListenerBound = true;
+          window.addEventListener('storage', (ev) => {
+            if (ev.key === 'fast_talk_pulse' && ev.newValue) {
+              try {
+                handleIncomingBusMessage(JSON.parse(ev.newValue));
+              } catch {
+                // ignore
+              }
+            }
+          });
+        }
+        ensurePeerHeartbeat();
+      }
+
+      function broadcastPeerAnnounce(reply = false) {
+        if (!state.myUsername) return;
+        initLocalFallbackBus();
+        const myLower = state.myUsername.toLowerCase();
+        const ann = {
+          type: 'peer_announce',
+          fromLower: myLower,
+          username: state.myUsername,
+          joinedAt: Date.now(),
+          reply
+        };
+        if (state.localBus) {
+          try {
+            state.localBus.postMessage(ann);
+          } catch {}
+        }
+        try {
+          localStorage.setItem('fast_talk_pulse', JSON.stringify(ann));
+          localStorage.removeItem('fast_talk_pulse');
+        } catch {}
+
+        if (state.supabaseChannel && state.supabaseChannel.track) {
+          try {
+            state.supabaseChannel.track({
+              username: state.myUsername,
+              joinedAt: Date.now()
+            });
+          } catch {}
+        }
+      }
+
+      function initSupabaseRealtime(url, key) {
+        const targetUrl = url || state.supabaseUrl || SUPABASE_CONFIG.url;
+        const targetKey = key || state.supabaseKey || SUPABASE_CONFIG.anonKey;
+        if (!targetUrl || !targetKey || typeof window.supabase === 'undefined') return;
+
+        try {
+          if (state.supabaseChannel) {
+            try {
+              state.supabaseChannel.unsubscribe();
+            } catch {}
+            state.supabaseChannel = null;
+          }
+
+          const client = window.supabase.createClient(targetUrl, targetKey);
+          state.supabaseClient = client;
+
+          const ch = client.channel(SUPABASE_CONFIG.channel || 'fast_talk_global', {
+            config: {
+              broadcast: { self: false },
+              presence: { key: state.myUsername || 'anon' }
+            }
+          });
+
+          ch.on('presence', { event: 'sync' }, () => {
+            const presenceMap = ch.presenceState();
+            const users = [];
+            for (const [k, metas] of Object.entries(presenceMap)) {
+              if (
+                k &&
+                k !== 'anon' &&
+                k.toLowerCase() !== (state.myUsername || '').toLowerCase()
+              ) {
+                users.push({
+                  username: k,
+                  joinedAt: metas[0]?.joinedAt || Date.now()
+                });
+              }
+            }
+            if (users.length > 0 || state.onlineUsers.length > 0) {
               state.onlineUsers = mergeOnlineUsersList(
                 state.onlineUsers,
-                [{ username: data.username, joinedAt: data.joinedAt || Date.now() }],
+                users,
                 state.myUsername
               );
-              state.totalOnline = Math.max(state.totalOnline, state.onlineUsers.length + 1);
+              state.totalOnline = Math.max(
+                state.onlineUsers.length + (state.myUsername ? 1 : 0),
+                1
+              );
               renderSidebar();
-              if (data.reply) {
-                try {
-                  bus.postMessage({
-                    type: 'peer_announce',
-                    fromLower: myLower,
-                    username: state.myUsername,
-                    joinedAt: Date.now(),
-                    reply: false
-                  });
-                } catch {
-                  // ignore
+            }
+          })
+            .on('broadcast', { event: 'signal' }, ({ payload }) => {
+              if (!payload || !state.myUsername) return;
+              const myLower = state.myUsername.toLowerCase();
+              if (payload.to && payload.to.toLowerCase() === myLower) {
+                handleServerMessage(payload);
+              }
+            })
+            .subscribe(async (status) => {
+              if (status === 'SUBSCRIBED') {
+                state.supabaseChannel = ch;
+                state.connected = true;
+                updateConnectionStatusUI('connected', 'Connected (Supabase)');
+                if (state.myUsername) {
+                  await ch.track({ username: state.myUsername, joinedAt: Date.now() });
                 }
               }
-              return;
-            }
-
-            if (data.toLower && data.toLower !== myLower) return;
-            if (data.serverEvent) {
-              handleServerMessage(data.serverEvent);
-            }
-          };
-        } catch {
-          // ignore
+            });
+        } catch (err) {
+          console.warn('[Fast Talk] Supabase init notice:', err);
         }
       }
 
       function broadcastLocalPeerEvent(toUsername, serverEvent) {
         initLocalFallbackBus();
-        if (!state.localBus || !state.myUsername) return;
+        const payloadData = {
+          fromLower: state.myUsername ? state.myUsername.toLowerCase() : undefined,
+          toLower: toUsername ? toUsername.toLowerCase() : undefined,
+          serverEvent,
+          _ts: Date.now()
+        };
+
+        if (state.localBus) {
+          try {
+            state.localBus.postMessage(payloadData);
+          } catch {}
+        }
+
         try {
-          state.localBus.postMessage({
-            fromLower: state.myUsername.toLowerCase(),
-            toLower: toUsername ? toUsername.toLowerCase() : undefined,
-            serverEvent
-          });
-        } catch {
-          // ignore
+          localStorage.setItem('fast_talk_pulse', JSON.stringify(payloadData));
+          localStorage.removeItem('fast_talk_pulse');
+        } catch {}
+
+        if (state.supabaseChannel && state.supabaseChannel.send) {
+          try {
+            state.supabaseChannel.send({
+              type: 'broadcast',
+              event: 'signal',
+              payload: {
+                ...serverEvent,
+                to: toUsername,
+                from: state.myUsername
+              }
+            });
+          } catch {}
         }
       }
 
@@ -2473,6 +2721,7 @@
             users: state.onlineUsers,
             totalOnline: Math.max(1, state.onlineUsers.length + 1)
           });
+          broadcastPeerAnnounce(true);
           return;
         }
         if (payload.type === 'logout') {
@@ -2553,6 +2802,7 @@
 
       async function flushHttpTransport() {
         if (state.intentionalLogout) return;
+        if (IS_STATIC_HOST && !state.customWsServer) return;
         if (state.httpFlushInFlight) return;
         state.httpFlushInFlight = true;
 
@@ -2588,7 +2838,6 @@
 
           reconcileServerSnapshot(data);
         } catch {
-          // If server HTTP endpoint is unreachable and we had outgoing messages, use local fallback
           if (!state.connected && batch.length > 0) {
             for (const item of batch) {
               dispatchLocalFallback(item);
@@ -2604,6 +2853,12 @@
 
       let searchFetchController = null;
       async function fetchFastDirectorySearch(queryText = '') {
+        if (IS_STATIC_HOST && !state.customWsServer) {
+          renderDirectoryList();
+          renderInteriorHomePage();
+          return;
+        }
+
         try {
           if (searchFetchController) {
             searchFetchController.abort();
@@ -2658,7 +2913,7 @@
           };
         }
 
-        // Also mirror critical peer signaling onto local BroadcastChannel for instant 0ms same-browser tabs
+        // Mirror EVERY peer signaling event across BroadcastChannel, storage event, and Supabase broadcast
         if (payload && state.myUsername) {
           if (payload.type === 'chat_request' && payload.to) {
             broadcastLocalPeerEvent(payload.to, {
@@ -2670,7 +2925,7 @@
             broadcastLocalPeerEvent(payload.from, {
               type: 'chat_accepted',
               partner: state.myUsername,
-              initiator: true,
+              initiator: payload.initiator !== undefined ? payload.initiator : true,
               timestamp: Date.now()
             });
           } else if (payload.type === 'chat_decline' && payload.from) {
@@ -2711,6 +2966,25 @@
               partner: state.myUsername,
               reason: 'ended_by_partner'
             });
+          } else if (payload.type === 'rtc_signal' && payload.to) {
+            broadcastLocalPeerEvent(payload.to, {
+              type: 'rtc_signal',
+              from: state.myUsername,
+              signalType: payload.signalType,
+              data: payload.data
+            });
+          } else if (
+            (payload.type === 'file_meta' ||
+              payload.type === 'file_chunk' ||
+              payload.type === 'file_ack' ||
+              payload.type === 'file_complete' ||
+              payload.type === 'file_cancel') &&
+            payload.to
+          ) {
+            broadcastLocalPeerEvent(payload.to, {
+              ...payload,
+              from: state.myUsername
+            });
           }
         }
 
@@ -2724,8 +2998,10 @@
           }
         }
 
-        // Always queue idempotent session/connection control events via HTTP /api/events as well
-        // so half-open mobile WebSockets never drop registration or Connect/Accept actions.
+        if (IS_STATIC_HOST && !state.customWsServer) {
+          return true;
+        }
+
         const isCriticalControl =
           payload &&
           (payload.type === 'register' ||
@@ -2745,11 +3021,26 @@
 
       function connectWebSocket() {
         initLocalFallbackBus();
-        ensureHttpPollLoop();
+        ensurePeerHeartbeat();
 
-        if (!state.connected) {
-          flushHttpTransport();
+        if (IS_STATIC_HOST && !state.customWsServer) {
+          state.connected = true;
+          updateConnectionStatusUI('connected', 'Connected (Mesh/P2P)');
+          initSupabaseRealtime(
+            state.supabaseUrl || SUPABASE_CONFIG.url,
+            state.supabaseKey || SUPABASE_CONFIG.anonKey
+          );
+          return;
         }
+
+        const targetWsUrl = state.customWsServer || WS_SERVER_URL;
+        if (!targetWsUrl) {
+          state.connected = true;
+          updateConnectionStatusUI('connected', 'Connected (Mesh/P2P)');
+          return;
+        }
+
+        ensureHttpPollLoop();
 
         if (
           state.ws &&
@@ -2765,10 +3056,10 @@
 
         let ws;
         try {
-          const sep = WS_SERVER_URL.includes('?') ? '&' : '?';
-          ws = new WebSocket(`${WS_SERVER_URL}${sep}connId=${encodeURIComponent(state.connId)}`);
+          const sep = targetWsUrl.includes('?') ? '&' : '?';
+          ws = new WebSocket(`${targetWsUrl}${sep}connId=${encodeURIComponent(state.connId)}`);
         } catch {
-          flushHttpTransport();
+          if (!IS_STATIC_HOST) flushHttpTransport();
           return;
         }
         state.ws = ws;
@@ -2957,15 +3248,25 @@
             const lower = (msg.from || '').toLowerCase();
             if (!lower || state.chats.has(lower)) break;
 
-            // If we already sent an outgoing request to this user, mutual request = auto-accept!
+            // If we already sent an outgoing request to this user, mutual request = instant auto-accept!
             const existing = state.pendingRequests.get(lower);
             if (existing && existing.direction === 'outgoing') {
-              sendWs({ type: 'chat_accept', from: msg.from });
-              handleServerMessage({
-                type: 'chat_accepted',
-                partner: msg.from,
-                initiator: true,
-                timestamp: Date.now()
+              const amInitiator = (state.myUsername || '').toLowerCase() > lower;
+              state.pendingRequests.delete(lower);
+              const session = ensureChatSession(msg.from, amInitiator);
+              appendSystemMessage(
+                session,
+                `Ephemeral 1-to-1 chat established with @${msg.from}. Messages and files will auto-wipe on close.`
+              );
+              selectActiveChat(lower);
+              setupWebRtcForSession(session);
+              showToast(`Connected with @${msg.from}`);
+              renderSidebar();
+
+              sendWs({
+                type: 'chat_accept',
+                from: msg.from,
+                initiator: !amInitiator
               });
               break;
             }
@@ -4513,7 +4814,18 @@
 
         const existingReq = state.pendingRequests.get(lower);
         if (existingReq && existingReq.direction === 'incoming') {
-          sendWs({ type: 'chat_accept', from: existingReq.username || cleanTarget });
+          const partnerName = existingReq.username || cleanTarget;
+          state.pendingRequests.delete(lower);
+          const session = ensureChatSession(partnerName, false);
+          appendSystemMessage(
+            session,
+            `Ephemeral 1-to-1 chat established with @${partnerName}. Messages and files will auto-wipe on close.`
+          );
+          selectActiveChat(lower);
+          setupWebRtcForSession(session);
+          showToast(`Connected with @${partnerName}`);
+          renderSidebar();
+          sendWs({ type: 'chat_accept', from: partnerName, initiator: true });
           return;
         }
 
@@ -4573,7 +4885,18 @@
         } else if (action === 'accept-request') {
           const from = btn.getAttribute('data-username');
           if (from) {
-            sendWs({ type: 'chat_accept', from });
+            const lower = from.toLowerCase();
+            state.pendingRequests.delete(lower);
+            const session = ensureChatSession(from, false);
+            appendSystemMessage(
+              session,
+              `Ephemeral 1-to-1 chat established with @${from}. Messages and files will auto-wipe on close.`
+            );
+            selectActiveChat(lower);
+            setupWebRtcForSession(session);
+            showToast(`Connected with @${from}`);
+            renderSidebar();
+            sendWs({ type: 'chat_accept', from, initiator: true });
           }
         } else if (action === 'decline-request') {
           const from = btn.getAttribute('data-username');
@@ -4773,6 +5096,49 @@
           els.copyInviteBtn.textContent = 'Copy Link';
         }, 1800);
       });
+
+      // Relay & Signaling Settings Modal Handlers
+      if (els.relayNavBtn) {
+        els.relayNavBtn.addEventListener('click', () => {
+          if (els.cfgCustomWs) els.cfgCustomWs.value = state.customWsServer || '';
+          if (els.cfgSupabaseUrl) {
+            els.cfgSupabaseUrl.value = state.supabaseUrl || SUPABASE_CONFIG.url || '';
+          }
+          if (els.cfgSupabaseKey) {
+            els.cfgSupabaseKey.value = state.supabaseKey || SUPABASE_CONFIG.anonKey || '';
+          }
+          if (els.relayModal) els.relayModal.classList.remove('hidden');
+        });
+      }
+
+      if (els.closeRelayModalBtn) {
+        els.closeRelayModalBtn.addEventListener('click', () => {
+          if (els.relayModal) els.relayModal.classList.add('hidden');
+        });
+      }
+
+      if (els.saveRelayModalBtn) {
+        els.saveRelayModalBtn.addEventListener('click', () => {
+          const wsVal = els.cfgCustomWs ? els.cfgCustomWs.value.trim() : '';
+          const supaUrl = els.cfgSupabaseUrl ? els.cfgSupabaseUrl.value.trim() : '';
+          const supaKey = els.cfgSupabaseKey ? els.cfgSupabaseKey.value.trim() : '';
+
+          state.customWsServer = wsVal;
+          state.supabaseUrl = supaUrl;
+          state.supabaseKey = supaKey;
+
+          if (els.relayModal) els.relayModal.classList.add('hidden');
+          showToast('Signaling settings updated. Reconnecting...');
+
+          if (supaUrl && supaKey) {
+            initSupabaseRealtime(supaUrl, supaKey);
+          }
+          if (wsVal || !IS_STATIC_HOST) {
+            connectWebSocket();
+          }
+          broadcastPeerAnnounce(true);
+        });
+      }
 
       // Ephemeral Rule: Tab Close Cleanup (revoke local Blob URLs without logging out on mobile tab switch)
       function handlePageUnload() {
