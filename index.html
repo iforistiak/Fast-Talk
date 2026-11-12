@@ -2506,11 +2506,104 @@
        * 2. Supabase Realtime (Presence + Broadcast) for static hosts like GitHub Pages
        * 3. BroadcastChannel + Storage pulse mesh for instant zero-latency same-device tabs
        */
+      const GLOBAL_MESH_TOPIC = 'fast_talk_signal_v2';
+      const GLOBAL_MESH_WS_URL = `wss://ntfy.sh/${GLOBAL_MESH_TOPIC}/ws`;
+      const GLOBAL_MESH_HTTP_URL = `https://ntfy.sh/${GLOBAL_MESH_TOPIC}`;
+
+      function publishGlobalMesh(dataObj) {
+        if (typeof fetch === 'undefined') return;
+        // Skip flooding individual trickle ICE candidates over HTTP POST; SDP offer/answer includes gathered candidates
+        if (
+          dataObj &&
+          dataObj.serverEvent &&
+          dataObj.serverEvent.type === 'rtc_signal' &&
+          dataObj.serverEvent.signalType === 'ice_candidate'
+        ) {
+          return;
+        }
+        try {
+          fetch(GLOBAL_MESH_HTTP_URL, {
+            method: 'POST',
+            body: JSON.stringify(dataObj),
+            mode: 'cors',
+            cache: 'no-store'
+          }).catch(() => {});
+        } catch {
+          // ignore network errors
+        }
+      }
+
+      function initGlobalMeshRelay() {
+        if (typeof WebSocket === 'undefined') return;
+        if (
+          state.globalMeshWs &&
+          (state.globalMeshWs.readyState === WebSocket.OPEN ||
+            state.globalMeshWs.readyState === WebSocket.CONNECTING)
+        ) {
+          return;
+        }
+        try {
+          const gws = new WebSocket(GLOBAL_MESH_WS_URL);
+          state.globalMeshWs = gws;
+
+          gws.addEventListener('open', () => {
+            state.globalMeshConnected = true;
+            if (state.myUsername && !state.intentionalLogout) {
+              broadcastPeerAnnounce(true);
+            }
+          });
+
+          gws.addEventListener('message', (ev) => {
+            if (!ev || typeof ev.data !== 'string') return;
+            try {
+              const env = JSON.parse(ev.data);
+              if (env && env.event === 'message' && typeof env.message === 'string') {
+                const inner = JSON.parse(env.message);
+                handleIncomingBusMessage(inner);
+              }
+            } catch {
+              // ignore non-protocol messages
+            }
+          });
+
+          gws.addEventListener('close', () => {
+            state.globalMeshConnected = false;
+            state.globalMeshWs = null;
+            if (!state.intentionalLogout) {
+              clearTimeout(state.globalMeshRetryTimer);
+              state.globalMeshRetryTimer = setTimeout(() => {
+                initGlobalMeshRelay();
+              }, 3000);
+            }
+          });
+
+          gws.addEventListener('error', () => {
+            // close handler will schedule reconnect
+          });
+        } catch {
+          // ignore WebSocket creation failure
+        }
+      }
+
       function ensurePeerHeartbeat() {
         if (state.peerHeartbeatTimer) return;
         state.peerHeartbeatTimer = setInterval(() => {
           if (state.myUsername && !state.intentionalLogout) {
             broadcastPeerAnnounce(false);
+
+            // Re-broadcast any pending outgoing chat requests so peers who just joined or switched tabs receive them
+            const now = Date.now();
+            for (const [lower, req] of state.pendingRequests.entries()) {
+              if (
+                req &&
+                req.direction === 'outgoing' &&
+                !state.chats.has(lower) &&
+                now - (req.lastRetryAt || 0) >= 3500
+              ) {
+                req.lastRetryAt = now;
+                sendWs({ type: 'chat_request', to: req.username });
+              }
+            }
           }
         }, 2500);
       }
@@ -2521,6 +2614,7 @@
         if (data.fromLower && data.fromLower === myLower) return;
 
         if (data.type === 'peer_announce' && data.username) {
+          const peerLower = data.username.toLowerCase();
           state.onlineUsers = mergeOnlineUsersList(
             state.onlineUsers,
             [{ username: data.username, joinedAt: data.joinedAt || Date.now() }],
@@ -2528,8 +2622,23 @@
           );
           state.totalOnline = Math.max(state.totalOnline, state.onlineUsers.length + 1);
           renderSidebar();
+
+          // If we have a pending outgoing request to this peer, deliver it immediately upon discovery
+          const pending = state.pendingRequests.get(peerLower);
+          if (pending && pending.direction === 'outgoing' && !state.chats.has(peerLower)) {
+            broadcastLocalPeerEvent(data.username, {
+              type: 'chat_request',
+              from: state.myUsername,
+              timestamp: pending.timestamp || Date.now()
+            });
+          }
+
           if (data.reply) {
-            broadcastPeerAnnounce(false);
+            const now = Date.now();
+            if (now - (state.lastAnnounceReplyAt || 0) >= 2000) {
+              state.lastAnnounceReplyAt = now;
+              broadcastPeerAnnounce(false, true);
+            }
           }
           return;
         }
@@ -2563,6 +2672,7 @@
             }
           });
         }
+        initGlobalMeshRelay();
         ensurePeerHeartbeat();
       }
 
@@ -2582,15 +2692,16 @@
         }
       }
 
-      function broadcastPeerAnnounce(reply = false) {
+      function broadcastPeerAnnounce(reply = false, forceGlobalReply = false) {
         if (!state.myUsername) return;
         initLocalFallbackBus();
         const myLower = state.myUsername.toLowerCase();
+        const now = Date.now();
         const ann = {
           type: 'peer_announce',
           fromLower: myLower,
           username: state.myUsername,
-          joinedAt: Date.now(),
+          joinedAt: now,
           reply
         };
         if (state.localBus) {
@@ -2600,11 +2711,20 @@
         }
         emitStoragePulse(ann);
 
+        if (
+          reply ||
+          forceGlobalReply ||
+          now - (state.lastGlobalAnnounceAt || 0) >= 12000
+        ) {
+          state.lastGlobalAnnounceAt = now;
+          publishGlobalMesh(ann);
+        }
+
         if (state.supabaseChannel && state.supabaseChannel.track) {
           try {
             state.supabaseChannel.track({
               username: state.myUsername,
-              joinedAt: Date.now()
+              joinedAt: now
             });
           } catch {}
         }
@@ -2699,6 +2819,7 @@
         }
 
         emitStoragePulse(payloadData);
+        publishGlobalMesh(payloadData);
 
         if (state.supabaseChannel && state.supabaseChannel.send) {
           try {
@@ -2744,11 +2865,19 @@
         let sidebarDirty = false;
 
         if (Array.isArray(data.onlineUsers)) {
+          const merged = mergeOnlineUsersList(
+            state.onlineUsers,
+            data.onlineUsers,
+            state.myUsername
+          );
           const prevKey = state.onlineUsers.map((u) => u.username).join(',');
-          const nextKey = data.onlineUsers.map((u) => u.username).join(',');
-          const nextTotal = Number(data.totalOnline) || data.onlineUsers.length + 1;
+          const nextKey = merged.map((u) => u.username).join(',');
+          const nextTotal = Math.max(
+            Number(data.totalOnline) || 1,
+            merged.length + 1
+          );
           if (prevKey !== nextKey || state.totalOnline !== nextTotal) {
-            state.onlineUsers = data.onlineUsers;
+            state.onlineUsers = merged;
             state.totalOnline = nextTotal;
             sidebarDirty = true;
           }
@@ -2772,18 +2901,17 @@
 
         if (Array.isArray(data.incomingRequests)) {
           for (const req of data.incomingRequests) {
-            if (!req || typeof req.from !== 'string') continue;
-            const lower = req.from.toLowerCase();
+            const fromName = typeof req === 'string' ? req : req && req.from;
+            if (!fromName || typeof fromName !== 'string') continue;
+            const lower = fromName.toLowerCase();
             if (state.chats.has(lower)) continue;
             const existing = state.pendingRequests.get(lower);
             if (!existing || existing.direction !== 'incoming') {
-              state.pendingRequests.set(lower, {
-                username: req.from,
-                direction: 'incoming',
-                timestamp: req.timestamp || Date.now()
+              handleServerMessage({
+                type: 'chat_request',
+                from: fromName,
+                timestamp: (typeof req === 'object' && req.timestamp) || Date.now()
               });
-              triggerNotificationPop('request', lower);
-              showToast(`Incoming chat request from @${req.from}`);
               sidebarDirty = true;
             }
           }
@@ -2791,14 +2919,15 @@
 
         if (Array.isArray(data.outgoingRequests)) {
           for (const req of data.outgoingRequests) {
-            if (!req || typeof req.to !== 'string') continue;
-            const lower = req.to.toLowerCase();
+            const toName = typeof req === 'string' ? req : req && req.to;
+            if (!toName || typeof toName !== 'string') continue;
+            const lower = toName.toLowerCase();
             if (state.chats.has(lower)) continue;
             if (!state.pendingRequests.has(lower)) {
               state.pendingRequests.set(lower, {
-                username: req.to,
+                username: toName,
                 direction: 'outgoing',
-                timestamp: req.timestamp || Date.now()
+                timestamp: (typeof req === 'object' && req.timestamp) || Date.now()
               });
               sidebarDirty = true;
             }
@@ -3249,7 +3378,18 @@
 
           case 'chat_request': {
             const lower = (msg.from || '').toLowerCase();
-            if (!lower || state.chats.has(lower)) break;
+            if (!lower) break;
+
+            // If we already have an active chat session with this peer, re-acknowledge with chat_accept so they transition immediately
+            if (state.chats.has(lower)) {
+              const activeSession = state.chats.get(lower);
+              sendWs({
+                type: 'chat_accept',
+                from: msg.from,
+                initiator: activeSession ? !activeSession.initiator : true
+              });
+              break;
+            }
 
             // If we already sent an outgoing request to this user, mutual request = instant auto-accept!
             const existing = state.pendingRequests.get(lower);
@@ -3271,6 +3411,15 @@
                 from: msg.from,
                 initiator: !amInitiator
               });
+              setTimeout(() => {
+                if (state.chats.has(lower)) {
+                  sendWs({
+                    type: 'chat_accept',
+                    from: msg.from,
+                    initiator: !amInitiator
+                  });
+                }
+              }, 1200);
               break;
             }
 
@@ -4836,6 +4985,11 @@
           showToast(`Connected with @${partnerName}`);
           renderSidebar();
           sendWs({ type: 'chat_accept', from: partnerName, initiator: true });
+          setTimeout(() => {
+            if (state.chats.has(lower)) {
+              sendWs({ type: 'chat_accept', from: partnerName, initiator: true });
+            }
+          }, 1200);
           return;
         }
 
@@ -4843,7 +4997,8 @@
         state.pendingRequests.set(lower, {
           username: cleanTarget,
           direction: 'outgoing',
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          lastRetryAt: Date.now()
         });
         renderSidebar();
         showToast(`Chat request sent to @${cleanTarget}`);
@@ -4907,6 +5062,11 @@
             showToast(`Connected with @${from}`);
             renderSidebar();
             sendWs({ type: 'chat_accept', from, initiator: true });
+            setTimeout(() => {
+              if (state.chats.has(lower)) {
+                sendWs({ type: 'chat_accept', from, initiator: true });
+              }
+            }, 1200);
           }
         } else if (action === 'decline-request') {
           const from = btn.getAttribute('data-username');

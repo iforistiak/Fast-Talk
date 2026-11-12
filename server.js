@@ -336,7 +336,7 @@ export function createFastTalkServer(options = {}) {
             initiator: false,
             timestamp: now
           });
-        } else if (!session.activePartners.has(otherLower)) {
+        } else if (!session.activePartners.has(otherLower) && !session.incomingRequests.has(otherLower)) {
           session.incomingRequests.add(otherLower);
           sendToConn(session.conn, {
             type: 'chat_request',
@@ -1082,6 +1082,9 @@ export function createFastTalkServer(options = {}) {
 
   // Common security headers compatible with iframe preview & standalone browsers
   const SECURITY_HEADERS = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS, HEAD',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'X-Content-Type-Options': 'nosniff',
     'Referrer-Policy': 'no-referrer',
     'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
@@ -1090,6 +1093,12 @@ export function createFastTalkServer(options = {}) {
 
   // Serve index.html, /healthz, and /api/events real-time HTTP fallback on the same port
   const httpServer = http.createServer((req, res) => {
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, SECURITY_HEADERS);
+      res.end();
+      return;
+    }
+
     const reqUrl = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
 
     if ((req.method === 'GET' || req.method === 'HEAD') && reqUrl.pathname === '/healthz') {
