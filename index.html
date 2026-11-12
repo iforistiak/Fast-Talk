@@ -2506,30 +2506,131 @@
        * 2. Supabase Realtime (Presence + Broadcast) for static hosts like GitHub Pages
        * 3. BroadcastChannel + Storage pulse mesh for instant zero-latency same-device tabs
        */
-      const GLOBAL_MESH_TOPIC = 'fast_talk_signal_v2';
-      const GLOBAL_MESH_WS_URL = `wss://ntfy.sh/${GLOBAL_MESH_TOPIC}/ws`;
-      const GLOBAL_MESH_HTTP_URL = `https://ntfy.sh/${GLOBAL_MESH_TOPIC}`;
+      const MQTT_BROKERS = [
+        'wss://broker.emqx.io:8084/mqtt',
+        'wss://broker.hivemq.com:8884/mqtt',
+        'wss://test.mosquitto.org:8081/mqtt'
+      ];
+      const GLOBAL_MESH_TOPIC = 'fast_talk/v3/mesh_bus';
+
+      function mqttEncodeVarLen(len) {
+        const out = [];
+        do {
+          let byte = len % 128;
+          len = Math.floor(len / 128);
+          if (len > 0) byte |= 128;
+          out.push(byte);
+        } while (len > 0);
+        return Uint8Array.from(out);
+      }
+
+      function mqttEncodeStr(str) {
+        const b = new TextEncoder().encode(str);
+        const out = new Uint8Array(2 + b.length);
+        out[0] = (b.length >> 8) & 0xff;
+        out[1] = b.length & 0xff;
+        out.set(b, 2);
+        return out;
+      }
+
+      function mqttBuildConnectPacket(clientId) {
+        const vh = new Uint8Array([0x00, 0x04, 0x4d, 0x51, 0x54, 0x54, 0x04, 0x02, 0x00, 0x3c]);
+        const pl = mqttEncodeStr(clientId);
+        const rl = mqttEncodeVarLen(vh.length + pl.length);
+        const pkt = new Uint8Array(1 + rl.length + vh.length + pl.length);
+        pkt[0] = 0x10;
+        pkt.set(rl, 1);
+        pkt.set(vh, 1 + rl.length);
+        pkt.set(pl, 1 + rl.length + vh.length);
+        return pkt;
+      }
+
+      function mqttBuildSubscribePacket(topic, packetId = 1) {
+        const ts = mqttEncodeStr(topic);
+        const bodyLen = 2 + ts.length + 1;
+        const rl = mqttEncodeVarLen(bodyLen);
+        const pkt = new Uint8Array(1 + rl.length + bodyLen);
+        let o = 0;
+        pkt[o++] = 0x82;
+        pkt.set(rl, o);
+        o += rl.length;
+        pkt[o++] = (packetId >> 8) & 0xff;
+        pkt[o++] = packetId & 0xff;
+        pkt.set(ts, o);
+        o += ts.length;
+        pkt[o++] = 0x00;
+        return pkt;
+      }
+
+      function mqttBuildPublishPacket(topic, jsonStr) {
+        const ts = mqttEncodeStr(topic);
+        const pb = new TextEncoder().encode(jsonStr);
+        const bodyLen = ts.length + pb.length;
+        const rl = mqttEncodeVarLen(bodyLen);
+        const pkt = new Uint8Array(1 + rl.length + bodyLen);
+        let o = 0;
+        pkt[o++] = 0x30;
+        pkt.set(rl, o);
+        o += rl.length;
+        pkt.set(ts, o);
+        o += ts.length;
+        pkt.set(pb, o);
+        return pkt;
+      }
+
+      function mqttParseIncomingPackets(u8) {
+        const messages = [];
+        let idx = 0;
+        while (idx < u8.length) {
+          const type = u8[idx] & 0xf0;
+          let mult = 1;
+          let val = 0;
+          let pos = idx + 1;
+          let encodedByte;
+          do {
+            if (pos >= u8.length) return { messages };
+            encodedByte = u8[pos++];
+            val += (encodedByte & 127) * mult;
+            mult *= 128;
+          } while ((encodedByte & 128) !== 0);
+          const end = pos + val;
+          if (end > u8.length) break;
+          if (type === 0x30) {
+            const qos = (u8[idx] >> 1) & 0x03;
+            const tLen = (u8[pos] << 8) | u8[pos + 1];
+            const pStart = pos + 2 + tLen + (qos > 0 ? 2 : 0);
+            if (pStart <= end) {
+              const msgBytes = u8.subarray(pStart, end);
+              messages.push(new TextDecoder().decode(msgBytes));
+            }
+          }
+          idx = end;
+        }
+        return { messages };
+      }
 
       function publishGlobalMesh(dataObj) {
-        if (typeof fetch === 'undefined') return;
-        // Skip flooding individual trickle ICE candidates over HTTP POST; SDP offer/answer includes gathered candidates
+        if (!dataObj) return;
+        initGlobalMeshRelay();
+        const jsonStr = JSON.stringify({
+          ...dataObj,
+          _cid: state.connId
+        });
         if (
-          dataObj &&
-          dataObj.serverEvent &&
-          dataObj.serverEvent.type === 'rtc_signal' &&
-          dataObj.serverEvent.signalType === 'ice_candidate'
+          state.globalMeshWs &&
+          state.globalMeshWs.readyState === WebSocket.OPEN &&
+          state.globalMeshReady
         ) {
-          return;
+          try {
+            state.globalMeshWs.send(mqttBuildPublishPacket(GLOBAL_MESH_TOPIC, jsonStr));
+            return;
+          } catch {
+            // fall through to outbox
+          }
         }
-        try {
-          fetch(GLOBAL_MESH_HTTP_URL, {
-            method: 'POST',
-            body: JSON.stringify(dataObj),
-            mode: 'cors',
-            cache: 'no-store'
-          }).catch(() => {});
-        } catch {
-          // ignore network errors
+        if (!state.globalMeshOutbox) state.globalMeshOutbox = [];
+        if (state.globalMeshOutbox.length < 400) {
+          state.globalMeshOutbox.push(jsonStr);
         }
       }
 
@@ -2542,46 +2643,95 @@
         ) {
           return;
         }
+
+        const brokerIdx = (state.mqttBrokerIndex || 0) % MQTT_BROKERS.length;
+        const brokerUrl = MQTT_BROKERS[brokerIdx];
+
         try {
-          const gws = new WebSocket(GLOBAL_MESH_WS_URL);
+          const gws = new WebSocket(brokerUrl, 'mqtt');
+          gws.binaryType = 'arraybuffer';
           state.globalMeshWs = gws;
+          state.globalMeshReady = false;
 
           gws.addEventListener('open', () => {
-            state.globalMeshConnected = true;
-            if (state.myUsername && !state.intentionalLogout) {
-              broadcastPeerAnnounce(true);
-            }
+            try {
+              const clientId = `ft_${state.connId.replace(/[^a-zA-Z0-9]/g, '').slice(0, 14)}_${Math.floor(Math.random() * 9999)}`;
+              gws.send(mqttBuildConnectPacket(clientId));
+            } catch {}
           });
 
           gws.addEventListener('message', (ev) => {
-            if (!ev || typeof ev.data !== 'string') return;
-            try {
-              const env = JSON.parse(ev.data);
-              if (env && env.event === 'message' && typeof env.message === 'string') {
-                const inner = JSON.parse(env.message);
-                handleIncomingBusMessage(inner);
+            if (!ev || !(ev.data instanceof ArrayBuffer)) return;
+            const u8 = new Uint8Array(ev.data);
+            if (u8.length === 0) return;
+
+            const topType = u8[0] & 0xf0;
+            if (topType === 0x20) {
+              // CONNACK received -> Subscribe to global mesh topic
+              try {
+                gws.send(mqttBuildSubscribePacket(GLOBAL_MESH_TOPIC, 1));
+              } catch {}
+              return;
+            }
+            if (topType === 0x90) {
+              // SUBACK received -> Mesh is live and ready!
+              state.globalMeshReady = true;
+              state.globalMeshConnected = true;
+              clearInterval(state.mqttPingTimer);
+              state.mqttPingTimer = setInterval(() => {
+                if (state.globalMeshWs === gws && gws.readyState === WebSocket.OPEN) {
+                  try {
+                    gws.send(new Uint8Array([0xc0, 0x00]));
+                  } catch {}
+                }
+              }, 20000);
+
+              if (Array.isArray(state.globalMeshOutbox) && state.globalMeshOutbox.length > 0) {
+                const queued = state.globalMeshOutbox.splice(0, state.globalMeshOutbox.length);
+                for (const itemStr of queued) {
+                  try {
+                    gws.send(mqttBuildPublishPacket(GLOBAL_MESH_TOPIC, itemStr));
+                  } catch {}
+                }
               }
-            } catch {
-              // ignore non-protocol messages
+
+              if (state.myUsername && !state.intentionalLogout) {
+                broadcastPeerAnnounce(true);
+              }
+              return;
+            }
+
+            const { messages } = mqttParseIncomingPackets(u8);
+            for (const rawStr of messages) {
+              try {
+                const parsed = JSON.parse(rawStr);
+                if (parsed && parsed._cid === state.connId) continue;
+                handleIncomingBusMessage(parsed);
+              } catch {
+                // ignore malformed frame
+              }
             }
           });
 
           gws.addEventListener('close', () => {
             state.globalMeshConnected = false;
+            state.globalMeshReady = false;
             state.globalMeshWs = null;
+            clearInterval(state.mqttPingTimer);
             if (!state.intentionalLogout) {
+              state.mqttBrokerIndex = ((state.mqttBrokerIndex || 0) + 1) % MQTT_BROKERS.length;
               clearTimeout(state.globalMeshRetryTimer);
               state.globalMeshRetryTimer = setTimeout(() => {
                 initGlobalMeshRelay();
-              }, 3000);
+              }, 1500);
             }
           });
 
           gws.addEventListener('error', () => {
-            // close handler will schedule reconnect
+            // close handler will rotate broker and reconnect
           });
         } catch {
-          // ignore WebSocket creation failure
+          state.mqttBrokerIndex = ((state.mqttBrokerIndex || 0) + 1) % MQTT_BROKERS.length;
         }
       }
 
@@ -2591,21 +2741,44 @@
           if (state.myUsername && !state.intentionalLogout) {
             broadcastPeerAnnounce(false);
 
-            // Re-broadcast any pending outgoing chat requests so peers who just joined or switched tabs receive them
             const now = Date.now();
+            // Re-broadcast any pending outgoing chat requests so peers who just joined or switched tabs receive them
             for (const [lower, req] of state.pendingRequests.entries()) {
               if (
                 req &&
                 req.direction === 'outgoing' &&
                 !state.chats.has(lower) &&
-                now - (req.lastRetryAt || 0) >= 3500
+                now - (req.lastRetryAt || 0) >= 3000
               ) {
                 req.lastRetryAt = now;
                 sendWs({ type: 'chat_request', to: req.username });
               }
             }
+
+            // Re-transmit any unacknowledged outgoing text messages up to 4 times
+            for (const session of state.chats.values()) {
+              for (const m of session.messages) {
+                if (
+                  m.kind === 'text' &&
+                  m.direction === 'outgoing' &&
+                  !m.delivered &&
+                  !m.read &&
+                  (m.retryCount || 0) < 4 &&
+                  now - (m.lastSentAt || m.timestamp) >= 1800
+                ) {
+                  m.retryCount = (m.retryCount || 0) + 1;
+                  m.lastSentAt = now;
+                  sendWs({
+                    type: 'chat_message',
+                    id: m.id,
+                    to: session.partner,
+                    text: m.text
+                  });
+                }
+              }
+            }
           }
-        }, 2500);
+        }, 2000);
       }
 
       function handleIncomingBusMessage(data) {
@@ -3080,31 +3253,74 @@
               timestamp: Date.now()
             });
           } else if (payload.type === 'chat_message' && payload.to) {
-            broadcastLocalPeerEvent(payload.to, {
+            const msgEvt = {
               type: 'chat_message',
               id: payload.id,
               from: state.myUsername,
               text: payload.text,
               timestamp: Date.now()
-            });
+            };
+            broadcastLocalPeerEvent(payload.to, msgEvt);
+            const s = state.chats.get(payload.to.toLowerCase());
+            if (s && s.dc && s.dc.readyState === 'open') {
+              try {
+                s.dc.send(JSON.stringify(msgEvt));
+              } catch {}
+            }
+          } else if (payload.type === 'chat_message_ack' && payload.to) {
+            const ackEvt = {
+              type: 'chat_message_ack',
+              id: payload.id,
+              from: state.myUsername,
+              timestamp: Date.now()
+            };
+            broadcastLocalPeerEvent(payload.to, ackEvt);
+            const s = state.chats.get(payload.to.toLowerCase());
+            if (s && s.dc && s.dc.readyState === 'open') {
+              try {
+                s.dc.send(JSON.stringify(ackEvt));
+              } catch {}
+            }
           } else if (payload.type === 'typing' && payload.to) {
-            broadcastLocalPeerEvent(payload.to, {
+            const typEvt = {
               type: 'typing',
               from: state.myUsername,
               isTyping: Boolean(payload.isTyping)
-            });
+            };
+            broadcastLocalPeerEvent(payload.to, typEvt);
+            const s = state.chats.get(payload.to.toLowerCase());
+            if (s && s.dc && s.dc.readyState === 'open') {
+              try {
+                s.dc.send(JSON.stringify(typEvt));
+              } catch {}
+            }
           } else if (payload.type === 'read_receipt' && payload.to) {
-            broadcastLocalPeerEvent(payload.to, {
+            const rrEvt = {
               type: 'read_receipt',
               from: state.myUsername,
+              messageIds: Array.isArray(payload.messageIds) ? payload.messageIds : [],
               timestamp: Date.now()
-            });
+            };
+            broadcastLocalPeerEvent(payload.to, rrEvt);
+            const s = state.chats.get(payload.to.toLowerCase());
+            if (s && s.dc && s.dc.readyState === 'open') {
+              try {
+                s.dc.send(JSON.stringify(rrEvt));
+              } catch {}
+            }
           } else if (payload.type === 'end_chat' && payload.to) {
-            broadcastLocalPeerEvent(payload.to, {
+            const wipeEvt = {
               type: 'chat_wiped',
               partner: state.myUsername,
               reason: 'ended_by_partner'
-            });
+            };
+            broadcastLocalPeerEvent(payload.to, wipeEvt);
+            const s = state.chats.get(payload.to.toLowerCase());
+            if (s && s.dc && s.dc.readyState === 'open') {
+              try {
+                s.dc.send(JSON.stringify(wipeEvt));
+              } catch {}
+            }
           } else if (payload.type === 'rtc_signal' && payload.to) {
             broadcastLocalPeerEvent(payload.to, {
               type: 'rtc_signal',
@@ -3486,9 +3702,26 @@
             if (!session) {
               session = ensureChatSession(sender, false);
               state.pendingRequests.delete(lower);
+              appendSystemMessage(
+                session,
+                `Ephemeral 1-to-1 chat established with @${sender}. Messages and files will auto-wipe on close.`
+              );
+              setupWebRtcForSession(session);
+            }
+
+            // Always acknowledge receipt of the message ID so sender stops retrying
+            if (msg.id) {
+              sendWs({
+                type: 'chat_message_ack',
+                id: msg.id,
+                to: session.partner
+              });
             }
 
             if (msg.id && session.messages.some((m) => m.id === msg.id)) {
+              if (state.activePartnerLower === lower) {
+                sendReadReceiptForSession(session);
+              }
               break;
             }
 
@@ -3502,7 +3735,8 @@
               from: sender,
               text: msg.text,
               timestamp: msg.timestamp || Date.now(),
-              read: true
+              read: true,
+              ackReadSent: false
             };
             session.messages.push(item);
             session.lastActivity = item.timestamp;
@@ -3510,14 +3744,30 @@
 
             triggerNotificationPop('message', lower);
 
-            if (state.activePartnerLower !== lower) {
+            // If user isn't currently viewing another active chat, auto-focus this chat so they see the message immediately
+            if (!state.activePartnerLower) {
+              selectActiveChat(lower);
+            } else if (state.activePartnerLower !== lower) {
               session.unread += 1;
+              renderSidebar();
             } else {
               renderMessagesForActiveChat();
               updateTypingIndicatorUI();
-              sendWs({ type: 'read_receipt', to: session.partner });
+              sendReadReceiptForSession(session);
+              renderSidebar();
             }
-            renderSidebar();
+            break;
+          }
+
+          case 'chat_message_ack': {
+            const lower = (msg.from || msg.to || '').toLowerCase();
+            const session = state.chats.get(lower);
+            if (session && msg.id) {
+              const targetMsg = session.messages.find((m) => m.id === msg.id);
+              if (targetMsg) {
+                targetMsg.delivered = true;
+              }
+            }
             break;
           }
 
@@ -3526,15 +3776,20 @@
             const session = state.chats.get(lower);
             if (!session) break;
 
+            // Only mark specific outgoing messages/files as Read when their IDs are explicitly acknowledged by the partner
+            const ackIds = Array.isArray(msg.messageIds) ? new Set(msg.messageIds) : null;
+            if (!ackIds || ackIds.size === 0) break;
+
             let updated = false;
             for (const m of session.messages) {
-              if (m.direction === 'outgoing' && !m.read) {
+              if (m.direction === 'outgoing' && !m.read && ackIds.has(m.id)) {
                 m.read = true;
+                m.delivered = true;
                 updated = true;
               }
             }
             for (const f of session.files.values()) {
-              if (f.direction === 'outgoing' && !f.read) {
+              if (f.direction === 'outgoing' && !f.read && ackIds.has(f.fileId)) {
                 f.read = true;
                 updated = true;
               }
@@ -3569,17 +3824,34 @@
           }
 
           case 'rtc_signal': {
-            const lower = (msg.from || '').toLowerCase();
-            const session = state.chats.get(lower);
-            if (!session) break;
+            const sender = msg.from;
+            if (!sender) break;
+            const lower = sender.toLowerCase();
+            let session = state.chats.get(lower);
+            if (!session) {
+              session = ensureChatSession(sender, false);
+              state.pendingRequests.delete(lower);
+            }
             handleIncomingRtcSignal(session, msg.signalType, msg.data);
             break;
           }
 
           case 'file_meta': {
-            const lower = (msg.from || '').toLowerCase();
-            const session = state.chats.get(lower);
-            if (!session) break;
+            const sender = msg.from;
+            if (!sender) break;
+            const lower = sender.toLowerCase();
+            let session = state.chats.get(lower);
+            if (!session) {
+              session = ensureChatSession(sender, false);
+              state.pendingRequests.delete(lower);
+              appendSystemMessage(
+                session,
+                `Ephemeral 1-to-1 chat established with @${sender}. Messages and files will auto-wipe on close.`
+              );
+            }
+            if (!state.activePartnerLower) {
+              selectActiveChat(lower);
+            }
             triggerNotificationPop('message', lower);
             handleIncomingFileMeta(session, msg, 'relay');
             break;
@@ -3824,6 +4096,21 @@
                   signalType: 'offer',
                   data: pc.localDescription
                 });
+                // Also re-send complete SDP with gathered STUN ICE candidates after 450ms
+                setTimeout(() => {
+                  if (
+                    session.pc === pc &&
+                    pc.localDescription &&
+                    (!session.dc || session.dc.readyState !== 'open')
+                  ) {
+                    sendWs({
+                      type: 'rtc_signal',
+                      to: session.partner,
+                      signalType: 'offer',
+                      data: pc.localDescription
+                    });
+                  }
+                }, 450);
               })
               .catch(() => {
                 session.transportState = 'relay';
@@ -3846,6 +4133,22 @@
         dc.onopen = () => {
           clearTimeout(fallbackTimer);
           session.transportState = 'p2p';
+          // Flush any unacknowledged outgoing text messages directly over P2P DataChannel
+          for (const m of session.messages) {
+            if (m.kind === 'text' && m.direction === 'outgoing' && !m.delivered && !m.read) {
+              try {
+                dc.send(
+                  JSON.stringify({
+                    type: 'chat_message',
+                    id: m.id,
+                    from: state.myUsername,
+                    text: m.text,
+                    timestamp: m.timestamp
+                  })
+                );
+              } catch {}
+            }
+          }
         };
 
         dc.onclose = () => {
@@ -3869,6 +4172,14 @@
                 handleFileCancelNotification(session, ctrl.fileId, ctrl.reason);
               } else if (ctrl.type === 'chunk_header') {
                 session._nextDcChunkHeader = ctrl;
+              } else if (
+                ctrl.type === 'chat_message' ||
+                ctrl.type === 'chat_message_ack' ||
+                ctrl.type === 'typing' ||
+                ctrl.type === 'read_receipt' ||
+                ctrl.type === 'chat_wiped'
+              ) {
+                handleServerMessage(ctrl);
               }
             } catch {
               // ignore malformed control frame
@@ -3911,8 +4222,24 @@
               signalType: 'answer',
               data: pc.localDescription
             });
+            setTimeout(() => {
+              if (
+                session.pc === pc &&
+                pc.localDescription &&
+                (!session.dc || session.dc.readyState !== 'open')
+              ) {
+                sendWs({
+                  type: 'rtc_signal',
+                  to: session.partner,
+                  signalType: 'answer',
+                  data: pc.localDescription
+                });
+              }
+            }, 450);
           } else if (signalType === 'answer') {
-            await pc.setRemoteDescription(new RTCSessionDescription(data));
+            if (pc.signalingState === 'have-local-offer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(data));
+            }
             while (session.rtcCandidateQueue.length > 0) {
               const c = session.rtcCandidateQueue.shift();
               await pc.addIceCandidate(new RTCIceCandidate(c));
@@ -4109,12 +4436,12 @@
               });
             }
           } else {
-            while (
+            if (
               !transfer.cancelled &&
               chunkIndex - transfer.ackedChunkIndex > WS_RELAY_WINDOW_CHUNKS
             ) {
               await new Promise((resolve) => {
-                const timer = setTimeout(resolve, 80);
+                const timer = setTimeout(resolve, 160);
                 transfer.onAck = () => {
                   clearTimeout(timer);
                   transfer.onAck = null;
@@ -4132,6 +4459,9 @@
               chunkIndex,
               data: uint8ToBase64(new Uint8Array(arrayBuffer))
             });
+
+            // Smooth pacing for relay chunks so WebSocket/MQTT frames arrive in order without buffer overflow
+            await new Promise((r) => setTimeout(r, 12));
           }
 
           transfer.chunksTransferred = chunkIndex + 1;
@@ -4191,8 +4521,10 @@
           transport: transportMode,
           status: 'transferring',
           cancelled: false,
+          completeSignaled: false,
           blobUrl: null,
-          timestamp: meta.timestamp || Date.now()
+          timestamp: meta.timestamp || Date.now(),
+          ackReadSent: false
         };
 
         session.files.set(fileId, transfer);
@@ -4202,7 +4534,8 @@
           fileId,
           direction: 'incoming',
           from: session.partner,
-          timestamp: transfer.timestamp
+          timestamp: transfer.timestamp,
+          ackReadSent: false
         });
         session.lastActivity = transfer.timestamp;
         session.lastPreview = `File: ${safeName}`;
@@ -4211,9 +4544,35 @@
           session.unread += 1;
         } else {
           renderMessagesForActiveChat();
-          sendWs({ type: 'read_receipt', to: session.partner });
+          sendReadReceiptForSession(session);
         }
         renderSidebar();
+      }
+
+      function finalizeIncomingFile(session, transfer) {
+        if (!transfer || transfer.cancelled || transfer.status === 'completed') return;
+        clearTimeout(transfer.completeTimer);
+
+        const orderedParts = [];
+        for (let i = 0; i < transfer.totalChunks; i++) {
+          if (transfer.receivedChunks[i]) {
+            orderedParts.push(transfer.receivedChunks[i]);
+          }
+        }
+
+        const blob = new Blob(orderedParts, { type: transfer.mimeType });
+        const blobUrl = URL.createObjectURL(blob);
+        session.blobUrls.add(blobUrl);
+
+        transfer.blobUrl = blobUrl;
+        transfer.receivedChunks = [];
+        transfer.chunksTransferred = transfer.totalChunks;
+        transfer.status = 'completed';
+
+        if (state.activePartnerLower === session.lower) {
+          renderMessagesForActiveChat();
+          sendReadReceiptForSession(session);
+        }
       }
 
       function handleIncomingFileChunk(session, fileId, chunkIndex, uint8Bytes, transportMode) {
@@ -4241,30 +4600,27 @@
         }
 
         updateFileCardProgressDOM(session, transfer);
+
+        if (transfer.receivedCount >= transfer.totalChunks) {
+          finalizeIncomingFile(session, transfer);
+        }
       }
 
       function handleIncomingFileComplete(session, fileId) {
         const transfer = session.files.get(fileId);
         if (!transfer || transfer.cancelled || transfer.status === 'completed') return;
 
-        const orderedParts = [];
-        for (let i = 0; i < transfer.totalChunks; i++) {
-          if (transfer.receivedChunks[i]) {
-            orderedParts.push(transfer.receivedChunks[i]);
-          }
-        }
-
-        const blob = new Blob(orderedParts, { type: transfer.mimeType });
-        const blobUrl = URL.createObjectURL(blob);
-        session.blobUrls.add(blobUrl);
-
-        transfer.blobUrl = blobUrl;
-        transfer.receivedChunks = [];
-        transfer.chunksTransferred = transfer.totalChunks;
-        transfer.status = 'completed';
-
-        if (state.activePartnerLower === session.lower) {
-          renderMessagesForActiveChat();
+        transfer.completeSignaled = true;
+        if (transfer.receivedCount >= transfer.totalChunks) {
+          finalizeIncomingFile(session, transfer);
+        } else {
+          // Wait briefly for any trailing chunks still in flight over the relay
+          clearTimeout(transfer.completeTimer);
+          transfer.completeTimer = setTimeout(() => {
+            if (transfer.receivedCount > 0) {
+              finalizeIncomingFile(session, transfer);
+            }
+          }, 2000);
         }
       }
 
@@ -4664,6 +5020,26 @@
         els.directoryList.innerHTML = rowsHtml + directConnectCardHtml;
       }
 
+      function sendReadReceiptForSession(session) {
+        if (!session || state.activePartnerLower !== session.lower) return;
+        if (document.visibilityState && document.visibilityState === 'hidden') return;
+
+        const unreadIds = [];
+        for (const m of session.messages) {
+          if (m.direction === 'incoming' && m.id && !m.ackReadSent) {
+            m.ackReadSent = true;
+            unreadIds.push(m.id);
+          }
+        }
+        if (unreadIds.length > 0) {
+          sendWs({
+            type: 'read_receipt',
+            to: session.partner,
+            messageIds: unreadIds
+          });
+        }
+      }
+
       function selectActiveChat(lower) {
         const session = state.chats.get(lower);
         if (!session) return;
@@ -4682,7 +5058,7 @@
         renderMessagesForActiveChat();
         renderSidebar();
 
-        sendWs({ type: 'read_receipt', to: session.partner });
+        sendReadReceiptForSession(session);
       }
 
       function appendSystemMessage(session, text) {
@@ -5093,12 +5469,12 @@
       document.querySelector('.sidebar-scroll').addEventListener('click', handleDirectoryActionClick);
       els.homeQuickPeers.addEventListener('click', handleDirectoryActionClick);
 
-      // Explicitly send read_receipt when partner clicks/focuses inside active chat view
+      // Explicitly send read_receipt when partner clicks/focuses inside active chat view ONLY if unread incoming messages exist
       els.activeChatContainer.addEventListener('click', () => {
         if (!state.activePartnerLower) return;
         const session = state.chats.get(state.activePartnerLower);
         if (session) {
-          sendWs({ type: 'read_receipt', to: session.partner });
+          sendReadReceiptForSession(session);
         }
       });
 
@@ -5149,6 +5525,9 @@
           from: state.myUsername,
           text,
           timestamp,
+          lastSentAt: timestamp,
+          retryCount: 0,
+          delivered: false,
           read: false
         });
         session.lastActivity = timestamp;

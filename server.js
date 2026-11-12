@@ -896,13 +896,22 @@ export function createFastTalkServer(options = {}) {
       return;
     }
 
-    if (!partnerSession || !currentSession.activePartners.has(partnerLower)) {
+    if (!partnerSession) {
       sendToConn(conn, {
         type: 'error',
         code: 'NO_ACTIVE_CHAT',
         message: 'No active chat session with this user.'
       });
       return;
+    }
+
+    if (!currentSession.activePartners.has(partnerLower)) {
+      currentSession.activePartners.add(partnerLower);
+      partnerSession.activePartners.add(currentSession.lower);
+      currentSession.incomingRequests.delete(partnerLower);
+      currentSession.outgoingRequests.delete(partnerLower);
+      partnerSession.incomingRequests.delete(currentSession.lower);
+      partnerSession.outgoingRequests.delete(currentSession.lower);
     }
 
     // ------------------------------------------------------------------------
@@ -956,9 +965,13 @@ export function createFastTalkServer(options = {}) {
     }
 
     if (msg.type === 'read_receipt') {
+      const messageIds = Array.isArray(msg.messageIds)
+        ? msg.messageIds.filter((id) => typeof id === 'string').slice(0, 200)
+        : [];
       sendToConn(partnerSession.conn, {
         type: 'read_receipt',
         from: currentSession.username,
+        messageIds,
         timestamp: Date.now()
       });
       return;
