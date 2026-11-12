@@ -2566,6 +2566,22 @@
         ensurePeerHeartbeat();
       }
 
+      let storagePulseSeq = 0;
+      function emitStoragePulse(dataObj) {
+        if (typeof window === 'undefined' || !window.localStorage) return;
+        try {
+          storagePulseSeq++;
+          const pulseData = JSON.stringify({
+            ...dataObj,
+            _seq: storagePulseSeq,
+            _time: Date.now()
+          });
+          localStorage.setItem('fast_talk_pulse', pulseData);
+        } catch {
+          // ignore quota or security exceptions
+        }
+      }
+
       function broadcastPeerAnnounce(reply = false) {
         if (!state.myUsername) return;
         initLocalFallbackBus();
@@ -2582,10 +2598,7 @@
             state.localBus.postMessage(ann);
           } catch {}
         }
-        try {
-          localStorage.setItem('fast_talk_pulse', JSON.stringify(ann));
-          localStorage.removeItem('fast_talk_pulse');
-        } catch {}
+        emitStoragePulse(ann);
 
         if (state.supabaseChannel && state.supabaseChannel.track) {
           try {
@@ -2685,10 +2698,7 @@
           } catch {}
         }
 
-        try {
-          localStorage.setItem('fast_talk_pulse', JSON.stringify(payloadData));
-          localStorage.removeItem('fast_talk_pulse');
-        } catch {}
+        emitStoragePulse(payloadData);
 
         if (state.supabaseChannel && state.supabaseChannel.send) {
           try {
@@ -2838,7 +2848,7 @@
 
           reconcileServerSnapshot(data);
         } catch {
-          if (!state.connected && batch.length > 0) {
+          if (batch.length > 0) {
             for (const item of batch) {
               dispatchLocalFallback(item);
             }
@@ -2999,6 +3009,9 @@
         }
 
         if (IS_STATIC_HOST && !state.customWsServer) {
+          if (payload && (payload.type === 'register' || payload.type === 'logout')) {
+            dispatchLocalFallback(payload);
+          }
           return true;
         }
 
@@ -3166,21 +3179,8 @@
 
             renderSidebar();
 
-            // Announce presence on local BroadcastChannel so same-browser tabs discover immediately
-            initLocalFallbackBus();
-            if (state.localBus) {
-              try {
-                state.localBus.postMessage({
-                  type: 'peer_announce',
-                  fromLower: state.myUsername.toLowerCase(),
-                  username: state.myUsername,
-                  joinedAt: Date.now(),
-                  reply: true
-                });
-              } catch {
-                // ignore
-              }
-            }
+            // Announce presence across all local/mesh channels immediately
+            broadcastPeerAnnounce(true);
 
             // If user joined via an ?invite=username link, automatically send a chat request
             if (
@@ -3196,6 +3196,9 @@
 
           case 'register_error': {
             state.desiredRegistration = null;
+            state.myUsername = '';
+            els.workspaceView.classList.add('hidden');
+            els.landingView.classList.remove('hidden');
             els.landingError.textContent = msg.message || 'Registration failed.';
             els.landingError.classList.remove('hidden');
             break;
@@ -4753,19 +4756,26 @@
         }
         els.landingError.classList.add('hidden');
         state.intentionalLogout = false;
+        const regPayload = { type: 'register', isGuest: false, username: check.username };
         state.desiredRegistration = { isGuest: false, username: check.username };
-        if (!sendWs({ type: 'register', isGuest: false, username: check.username })) {
-          connectWebSocket();
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          dispatchLocalFallback(regPayload);
         }
+        sendWs(regPayload);
+        connectWebSocket();
       });
 
       els.guestJoinBtn.addEventListener('click', () => {
         els.landingError.classList.add('hidden');
         state.intentionalLogout = false;
-        state.desiredRegistration = { isGuest: true, username: '' };
-        if (!sendWs({ type: 'register', isGuest: true })) {
-          connectWebSocket();
+        const guestName = `Guest_${Math.floor(1000 + Math.random() * 9000)}`;
+        const regPayload = { type: 'register', isGuest: false, username: guestName };
+        state.desiredRegistration = { isGuest: false, username: guestName };
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          dispatchLocalFallback(regPayload);
         }
+        sendWs(regPayload);
+        connectWebSocket();
       });
 
       els.myUsernameDisplay.style.cursor = 'pointer';
@@ -5185,8 +5195,13 @@
         }
       }
       if (urlParams.get('autostart') === '1') {
-        state.desiredRegistration = { isGuest: true, username: '' };
-        sendWs({ type: 'register', isGuest: true });
+        const guestName = `Guest_${Math.floor(1000 + Math.random() * 9000)}`;
+        const regPayload = { type: 'register', isGuest: false, username: guestName };
+        state.desiredRegistration = { isGuest: false, username: guestName };
+        if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
+          dispatchLocalFallback(regPayload);
+        }
+        sendWs(regPayload);
       }
       })();
     </script>
