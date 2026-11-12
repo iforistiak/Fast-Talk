@@ -591,7 +591,15 @@ export function createFastTalkServer(options = {}) {
       }
 
       if (existing) {
-        if (isConnectionActive(existing.conn) && existing.conn !== conn) {
+        const hasLiveWs = Boolean(
+          existing.conn &&
+            existing.conn.ws &&
+            existing.conn.ws.readyState === WebSocket.OPEN
+        );
+        const hasRecentHttpPoll = Boolean(
+          existing.conn && !existing.conn.ws && Date.now() - existing.conn.lastSeen <= 2500
+        );
+        if ((hasLiveWs || hasRecentHttpPoll) && existing.conn !== conn) {
           sendToConn(conn, {
             type: 'register_error',
             message: `Username "${chosenUsername}" is already online. Please pick another username.`

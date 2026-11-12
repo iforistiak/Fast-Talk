@@ -474,7 +474,7 @@
       .sidebar-top-bar {
         background-color: var(--header-bg);
         color: var(--header-text);
-        padding: 12px 16px;
+        padding: 10px 12px;
         display: flex;
         align-items: center;
         justify-content: space-between;
@@ -487,12 +487,15 @@
         display: flex;
         flex-direction: column;
         min-width: 0;
+        flex: 1 1 auto;
+        overflow: hidden;
       }
 
       .user-identity-row {
         display: flex;
         align-items: center;
-        gap: 8px;
+        gap: 6px;
+        min-width: 0;
       }
 
       .current-username {
@@ -505,12 +508,15 @@
       }
 
       .connection-caption {
-        font-size: 12px;
+        font-size: 11.5px;
         color: #CBD5E1;
         display: flex;
         align-items: center;
-        gap: 5px;
+        gap: 4px;
         white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 100%;
       }
 
       .sidebar-actions {
@@ -524,10 +530,23 @@
         background-color: rgba(255, 255, 255, 0.08);
         color: #FFFFFF;
         border: 1px solid rgba(255, 255, 255, 0.16);
-        padding: 6px 10px;
+        padding: 6px 9px;
         font-size: 12px;
-        min-height: 44px;
-        min-width: 44px;
+        min-height: 38px;
+        min-width: 38px;
+      }
+
+      @media (max-width: 420px) {
+        .sidebar-top-bar {
+          padding: 8px 10px;
+          gap: 6px;
+        }
+        .btn-header-dark {
+          padding: 5px 7px;
+          font-size: 11px;
+          min-height: 36px;
+          min-width: 34px;
+        }
       }
 
       .btn-header-dark:hover:not(:disabled) {
@@ -1604,7 +1623,7 @@
                   <div class="partner-status-line">
                     <span id="chat-partner-online">Online</span>
                     <span aria-hidden="true">·</span>
-                    <span id="chat-session-label">Ephemeral Session</span>
+                    <span id="chat-session-label">Ephemeral</span>
                   </div>
                 </div>
               </div>
@@ -2512,6 +2531,7 @@
         'wss://test.mosquitto.org:8081/mqtt'
       ];
       const GLOBAL_MESH_TOPIC = 'fast_talk/v3/mesh_bus';
+      const PEER_SYNC_PREFIX = 'fast_talk/v3/sync';
 
       function mqttEncodeVarLen(len) {
         const out = [];
@@ -2562,14 +2582,14 @@
         return pkt;
       }
 
-      function mqttBuildPublishPacket(topic, jsonStr) {
+      function mqttBuildPublishPacket(topic, jsonStr, retain = false) {
         const ts = mqttEncodeStr(topic);
         const pb = new TextEncoder().encode(jsonStr);
         const bodyLen = ts.length + pb.length;
         const rl = mqttEncodeVarLen(bodyLen);
         const pkt = new Uint8Array(1 + rl.length + bodyLen);
         let o = 0;
-        pkt[o++] = 0x30;
+        pkt[o++] = retain ? 0x31 : 0x30;
         pkt.set(rl, o);
         o += rl.length;
         pkt.set(ts, o);
@@ -2601,7 +2621,10 @@
             const pStart = pos + 2 + tLen + (qos > 0 ? 2 : 0);
             if (pStart <= end) {
               const msgBytes = u8.subarray(pStart, end);
-              messages.push(new TextDecoder().decode(msgBytes));
+              const decoded = new TextDecoder().decode(msgBytes);
+              if (decoded) {
+                messages.push(decoded);
+              }
             }
           }
           idx = end;
@@ -2609,29 +2632,122 @@
         return { messages };
       }
 
-      function publishGlobalMesh(dataObj) {
-        if (!dataObj) return;
+      function sendRawMqttPacket(pkt) {
         initGlobalMeshRelay();
-        const jsonStr = JSON.stringify({
-          ...dataObj,
-          _cid: state.connId
-        });
         if (
           state.globalMeshWs &&
           state.globalMeshWs.readyState === WebSocket.OPEN &&
           state.globalMeshReady
         ) {
           try {
-            state.globalMeshWs.send(mqttBuildPublishPacket(GLOBAL_MESH_TOPIC, jsonStr));
-            return;
+            state.globalMeshWs.send(pkt);
+            return true;
           } catch {
             // fall through to outbox
           }
         }
-        if (!state.globalMeshOutbox) state.globalMeshOutbox = [];
-        if (state.globalMeshOutbox.length < 400) {
-          state.globalMeshOutbox.push(jsonStr);
+        if (!state.globalMeshPacketOutbox) state.globalMeshPacketOutbox = [];
+        if (state.globalMeshPacketOutbox.length < 400) {
+          state.globalMeshPacketOutbox.push(pkt);
         }
+        return false;
+      }
+
+      function subscribeMyPeerSync() {
+        if (!state.myUsername) return;
+        const myLower = state.myUsername.toLowerCase();
+        if (
+          state.globalMeshWs &&
+          state.globalMeshWs.readyState === WebSocket.OPEN &&
+          state.globalMeshReady
+        ) {
+          try {
+            state.globalMeshWs.send(
+              mqttBuildSubscribePacket(`${PEER_SYNC_PREFIX}/${myLower}/+`, 2)
+            );
+          } catch {}
+        }
+      }
+
+      function publishPeerSyncState(partnerUsername, forceClear = false) {
+        if (!state.myUsername || !partnerUsername) return;
+        const myLower = state.myUsername.toLowerCase();
+        const peerLower = partnerUsername.toLowerCase();
+        if (!peerLower || peerLower === myLower) return;
+
+        const syncTopic = `${PEER_SYNC_PREFIX}/${peerLower}/${myLower}`;
+        const session = !forceClear ? state.chats.get(peerLower) : null;
+        const pending = !forceClear ? state.pendingRequests.get(peerLower) : null;
+
+        if (!session && (!pending || pending.direction !== 'outgoing')) {
+          // Clear any retained sync packet on the broker for this peer pair
+          sendRawMqttPacket(mqttBuildPublishPacket(syncTopic, '', true));
+          return;
+        }
+
+        let syncObj;
+        if (session) {
+          const unackedMessages = [];
+          const receivedMessageIds = [];
+          const readMessageIds = [];
+          for (const m of session.messages) {
+            if (m.kind === 'text' && m.direction === 'outgoing' && !m.delivered && !m.read) {
+              unackedMessages.push({
+                id: m.id,
+                text: m.text,
+                timestamp: m.timestamp
+              });
+            } else if (m.direction === 'incoming' && m.id) {
+              receivedMessageIds.push(m.id);
+              if (m.ackReadSent) {
+                readMessageIds.push(m.id);
+              }
+            }
+          }
+          syncObj = {
+            type: 'peer_sync',
+            from: state.myUsername,
+            fromLower: myLower,
+            to: session.partner,
+            toLower: peerLower,
+            accepted: true,
+            initiator: !session.initiator,
+            unackedMessages: unackedMessages.slice(-25),
+            receivedMessageIds: receivedMessageIds.slice(-50),
+            readMessageIds: readMessageIds.slice(-50),
+            timestamp: Date.now(),
+            _cid: state.connId
+          };
+        } else {
+          syncObj = {
+            type: 'peer_sync',
+            from: state.myUsername,
+            fromLower: myLower,
+            to: pending.username,
+            toLower: peerLower,
+            requested: true,
+            timestamp: pending.timestamp || Date.now(),
+            _cid: state.connId
+          };
+        }
+
+        const jsonStr = JSON.stringify(syncObj);
+        sendRawMqttPacket(mqttBuildPublishPacket(syncTopic, jsonStr, true));
+        if (state.localBus) {
+          try {
+            state.localBus.postMessage(syncObj);
+          } catch {}
+        }
+        emitStoragePulse(syncObj);
+      }
+
+      function publishGlobalMesh(dataObj) {
+        if (!dataObj) return;
+        const jsonStr = JSON.stringify({
+          ...dataObj,
+          _cid: state.connId
+        });
+        sendRawMqttPacket(mqttBuildPublishPacket(GLOBAL_MESH_TOPIC, jsonStr, false));
       }
 
       function initGlobalMeshRelay() {
@@ -2667,14 +2783,19 @@
 
             const topType = u8[0] & 0xf0;
             if (topType === 0x20) {
-              // CONNACK received -> Subscribe to global mesh topic
+              // CONNACK received -> Subscribe to global mesh topic and per-peer sync mailbox
               try {
                 gws.send(mqttBuildSubscribePacket(GLOBAL_MESH_TOPIC, 1));
+                if (state.myUsername) {
+                  const myLower = state.myUsername.toLowerCase();
+                  gws.send(mqttBuildSubscribePacket(`${PEER_SYNC_PREFIX}/${myLower}/+`, 2));
+                }
               } catch {}
               return;
             }
             if (topType === 0x90) {
               // SUBACK received -> Mesh is live and ready!
+              const wasReady = state.globalMeshReady;
               state.globalMeshReady = true;
               state.globalMeshConnected = true;
               clearInterval(state.mqttPingTimer);
@@ -2686,17 +2807,32 @@
                 }
               }, 20000);
 
-              if (Array.isArray(state.globalMeshOutbox) && state.globalMeshOutbox.length > 0) {
-                const queued = state.globalMeshOutbox.splice(0, state.globalMeshOutbox.length);
-                for (const itemStr of queued) {
+              if (
+                Array.isArray(state.globalMeshPacketOutbox) &&
+                state.globalMeshPacketOutbox.length > 0
+              ) {
+                const queued = state.globalMeshPacketOutbox.splice(
+                  0,
+                  state.globalMeshPacketOutbox.length
+                );
+                for (const pkt of queued) {
                   try {
-                    gws.send(mqttBuildPublishPacket(GLOBAL_MESH_TOPIC, itemStr));
+                    gws.send(pkt);
                   } catch {}
                 }
               }
 
-              if (state.myUsername && !state.intentionalLogout) {
+              if (!wasReady && state.myUsername && !state.intentionalLogout) {
+                subscribeMyPeerSync();
                 broadcastPeerAnnounce(true);
+                for (const session of state.chats.values()) {
+                  publishPeerSyncState(session.partner);
+                }
+                for (const [, req] of state.pendingRequests.entries()) {
+                  if (req && req.direction === 'outgoing') {
+                    publishPeerSyncState(req.username);
+                  }
+                }
               }
               return;
             }
@@ -2723,7 +2859,7 @@
               clearTimeout(state.globalMeshRetryTimer);
               state.globalMeshRetryTimer = setTimeout(() => {
                 initGlobalMeshRelay();
-              }, 1500);
+              }, 1200);
             }
           });
 
@@ -2748,26 +2884,39 @@
                 req &&
                 req.direction === 'outgoing' &&
                 !state.chats.has(lower) &&
-                now - (req.lastRetryAt || 0) >= 3000
+                now - (req.lastRetryAt || 0) >= 2500
               ) {
                 req.lastRetryAt = now;
                 sendWs({ type: 'chat_request', to: req.username });
+                publishPeerSyncState(req.username);
               }
             }
 
-            // Re-transmit any unacknowledged outgoing text messages up to 4 times
+            // Re-sync active sessions and unacknowledged outgoing text messages continuously until acknowledged
             for (const session of state.chats.values()) {
+              if (!session.partnerConfirmedActive && now - (session.lastAcceptSyncAt || 0) >= 2500) {
+                session.lastAcceptSyncAt = now;
+                sendWs({
+                  type: 'chat_accept',
+                  from: session.partner,
+                  initiator: !session.initiator
+                });
+                publishPeerSyncState(session.partner);
+              }
+
+              let hasUnacked = false;
               for (const m of session.messages) {
                 if (
                   m.kind === 'text' &&
                   m.direction === 'outgoing' &&
                   !m.delivered &&
                   !m.read &&
-                  (m.retryCount || 0) < 4 &&
-                  now - (m.lastSentAt || m.timestamp) >= 1800
+                  (m.retryCount || 0) < 120 &&
+                  now - (m.lastSentAt || m.timestamp) >= 2200
                 ) {
                   m.retryCount = (m.retryCount || 0) + 1;
                   m.lastSentAt = now;
+                  hasUnacked = true;
                   sendWs({
                     type: 'chat_message',
                     id: m.id,
@@ -2775,6 +2924,9 @@
                     text: m.text
                   });
                 }
+              }
+              if (hasUnacked) {
+                publishPeerSyncState(session.partner);
               }
             }
           }
@@ -2786,6 +2938,80 @@
         const myLower = state.myUsername.toLowerCase();
         if (data.fromLower && data.fromLower === myLower) return;
 
+        if (data.type === 'peer_sync' && data.from && data.toLower === myLower) {
+          const now = Date.now();
+          // Ignore stale retained packets older than 10 minutes
+          if (data.timestamp && now - data.timestamp > 10 * 60 * 1000) return;
+
+          const peerLower = data.from.toLowerCase();
+          state.onlineUsers = mergeOnlineUsersList(
+            state.onlineUsers,
+            [{ username: data.from, joinedAt: data.timestamp || now }],
+            state.myUsername
+          );
+          state.totalOnline = Math.max(state.totalOnline, state.onlineUsers.length + 1);
+
+          const hasPending = state.pendingRequests.has(peerLower);
+          const isRecentForSession =
+            !state.sessionStartedAt || (data.timestamp || 0) >= state.sessionStartedAt - 15000;
+
+          if (data.accepted && (hasPending || state.chats.has(peerLower) || isRecentForSession)) {
+            if (!state.chats.has(peerLower)) {
+              handleServerMessage({
+                type: 'chat_accepted',
+                partner: data.from,
+                initiator: Boolean(data.initiator),
+                timestamp: data.timestamp || now
+              });
+            }
+            const session = state.chats.get(peerLower);
+            if (session) {
+              session.partnerConfirmedActive = true;
+            }
+          } else if (data.requested && !state.chats.has(peerLower) && isRecentForSession) {
+            handleServerMessage({
+              type: 'chat_request',
+              from: data.from,
+              timestamp: data.timestamp || now
+            });
+          }
+
+          const session = state.chats.get(peerLower);
+          if (session) {
+            if (Array.isArray(data.receivedMessageIds)) {
+              const recSet = new Set(data.receivedMessageIds);
+              for (const m of session.messages) {
+                if (m.direction === 'outgoing' && recSet.has(m.id)) {
+                  m.delivered = true;
+                }
+              }
+            }
+            if (Array.isArray(data.readMessageIds) && data.readMessageIds.length > 0) {
+              handleServerMessage({
+                type: 'read_receipt',
+                from: data.from,
+                messageIds: data.readMessageIds
+              });
+            }
+            if (Array.isArray(data.unackedMessages) && data.unackedMessages.length > 0) {
+              for (const um of data.unackedMessages) {
+                if (um && um.id && um.text !== undefined) {
+                  handleServerMessage({
+                    type: 'chat_message',
+                    id: um.id,
+                    from: data.from,
+                    text: um.text,
+                    timestamp: um.timestamp || now
+                  });
+                }
+              }
+              publishPeerSyncState(data.from);
+            }
+          }
+          renderSidebar();
+          return;
+        }
+
         if (data.type === 'peer_announce' && data.username) {
           const peerLower = data.username.toLowerCase();
           state.onlineUsers = mergeOnlineUsersList(
@@ -2794,6 +3020,33 @@
             state.myUsername
           );
           state.totalOnline = Math.max(state.totalOnline, state.onlineUsers.length + 1);
+
+          // If peer announces they already have an active chat with us, transition immediately!
+          if (Array.isArray(data.acceptedPeers) && data.acceptedPeers.includes(myLower)) {
+            if (!state.chats.has(peerLower)) {
+              handleServerMessage({
+                type: 'chat_accepted',
+                partner: data.username,
+                initiator: myLower > peerLower,
+                timestamp: Date.now()
+              });
+            }
+            const s = state.chats.get(peerLower);
+            if (s) {
+              s.partnerConfirmedActive = true;
+            }
+          } else if (
+            Array.isArray(data.requestedPeers) &&
+            data.requestedPeers.includes(myLower) &&
+            !state.chats.has(peerLower)
+          ) {
+            handleServerMessage({
+              type: 'chat_request',
+              from: data.username,
+              timestamp: Date.now()
+            });
+          }
+
           renderSidebar();
 
           // If we have a pending outgoing request to this peer, deliver it immediately upon discovery
@@ -2804,11 +3057,29 @@
               from: state.myUsername,
               timestamp: pending.timestamp || Date.now()
             });
+            publishPeerSyncState(data.username);
+          }
+
+          // If we have an active chat with this peer, sync state & flush any unacknowledged messages immediately
+          const activeSession = state.chats.get(peerLower);
+          if (activeSession) {
+            publishPeerSyncState(data.username);
+            for (const m of activeSession.messages) {
+              if (m.kind === 'text' && m.direction === 'outgoing' && !m.delivered && !m.read) {
+                broadcastLocalPeerEvent(data.username, {
+                  type: 'chat_message',
+                  id: m.id,
+                  from: state.myUsername,
+                  text: m.text,
+                  timestamp: m.timestamp
+                });
+              }
+            }
           }
 
           if (data.reply) {
             const now = Date.now();
-            if (now - (state.lastAnnounceReplyAt || 0) >= 2000) {
+            if (now - (state.lastAnnounceReplyAt || 0) >= 1500) {
               state.lastAnnounceReplyAt = now;
               broadcastPeerAnnounce(false, true);
             }
@@ -2870,11 +3141,17 @@
         initLocalFallbackBus();
         const myLower = state.myUsername.toLowerCase();
         const now = Date.now();
+        const acceptedPeers = Array.from(state.chats.keys());
+        const requestedPeers = Array.from(state.pendingRequests.entries())
+          .filter(([, r]) => r && r.direction === 'outgoing')
+          .map(([k]) => k);
         const ann = {
           type: 'peer_announce',
           fromLower: myLower,
           username: state.myUsername,
           joinedAt: now,
+          acceptedPeers,
+          requestedPeers,
           reply
         };
         if (state.localBus) {
@@ -2887,7 +3164,7 @@
         if (
           reply ||
           forceGlobalReply ||
-          now - (state.lastGlobalAnnounceAt || 0) >= 12000
+          now - (state.lastGlobalAnnounceAt || 0) >= 6000
         ) {
           state.lastGlobalAnnounceAt = now;
           publishGlobalMesh(ann);
@@ -3225,7 +3502,7 @@
           };
         }
 
-        // Mirror EVERY peer signaling event across BroadcastChannel, storage event, and Supabase broadcast
+        // Mirror EVERY peer signaling event across BroadcastChannel, storage event, MQTT sync mailbox, and Supabase broadcast
         if (payload && state.myUsername) {
           if (payload.type === 'chat_request' && payload.to) {
             broadcastLocalPeerEvent(payload.to, {
@@ -3233,6 +3510,7 @@
               from: state.myUsername,
               timestamp: Date.now()
             });
+            publishPeerSyncState(payload.to);
           } else if (payload.type === 'chat_accept' && payload.from) {
             broadcastLocalPeerEvent(payload.from, {
               type: 'chat_accepted',
@@ -3240,18 +3518,21 @@
               initiator: payload.initiator !== undefined ? payload.initiator : true,
               timestamp: Date.now()
             });
+            publishPeerSyncState(payload.from);
           } else if (payload.type === 'chat_decline' && payload.from) {
             broadcastLocalPeerEvent(payload.from, {
               type: 'chat_declined',
               from: state.myUsername,
               timestamp: Date.now()
             });
+            publishPeerSyncState(payload.from, true);
           } else if (payload.type === 'chat_request_cancel' && payload.to) {
             broadcastLocalPeerEvent(payload.to, {
               type: 'chat_request_cancelled',
               from: state.myUsername,
               timestamp: Date.now()
             });
+            publishPeerSyncState(payload.to, true);
           } else if (payload.type === 'chat_message' && payload.to) {
             const msgEvt = {
               type: 'chat_message',
@@ -3261,6 +3542,7 @@
               timestamp: Date.now()
             };
             broadcastLocalPeerEvent(payload.to, msgEvt);
+            publishPeerSyncState(payload.to);
             const s = state.chats.get(payload.to.toLowerCase());
             if (s && s.dc && s.dc.readyState === 'open') {
               try {
@@ -3275,6 +3557,7 @@
               timestamp: Date.now()
             };
             broadcastLocalPeerEvent(payload.to, ackEvt);
+            publishPeerSyncState(payload.to);
             const s = state.chats.get(payload.to.toLowerCase());
             if (s && s.dc && s.dc.readyState === 'open') {
               try {
@@ -3302,6 +3585,7 @@
               timestamp: Date.now()
             };
             broadcastLocalPeerEvent(payload.to, rrEvt);
+            publishPeerSyncState(payload.to);
             const s = state.chats.get(payload.to.toLowerCase());
             if (s && s.dc && s.dc.readyState === 'open') {
               try {
@@ -3315,6 +3599,7 @@
               reason: 'ended_by_partner'
             };
             broadcastLocalPeerEvent(payload.to, wipeEvt);
+            publishPeerSyncState(payload.to, true);
             const s = state.chats.get(payload.to.toLowerCase());
             if (s && s.dc && s.dc.readyState === 'open') {
               try {
@@ -3383,7 +3668,7 @@
 
         if (IS_STATIC_HOST && !state.customWsServer) {
           state.connected = true;
-          updateConnectionStatusUI('connected', 'Connected (Mesh/P2P)');
+          updateConnectionStatusUI('connected', 'Connected');
           initSupabaseRealtime(
             state.supabaseUrl || SUPABASE_CONFIG.url,
             state.supabaseKey || SUPABASE_CONFIG.anonKey
@@ -3394,7 +3679,7 @@
         const targetWsUrl = state.customWsServer || WS_SERVER_URL;
         if (!targetWsUrl) {
           state.connected = true;
-          updateConnectionStatusUI('connected', 'Connected (Mesh/P2P)');
+          updateConnectionStatusUI('connected', 'Connected');
           return;
         }
 
@@ -3505,6 +3790,7 @@
         switch (msg.type) {
           case 'registered': {
             state.myUsername = msg.username;
+            state.sessionStartedAt = state.sessionStartedAt || Date.now();
             state.desiredRegistration = null;
             state.onlineUsers = mergeOnlineUsersList(
               state.onlineUsers,
@@ -3524,7 +3810,8 @@
 
             renderSidebar();
 
-            // Announce presence across all local/mesh channels immediately
+            // Subscribe to per-peer MQTT sync mailbox & announce presence immediately
+            subscribeMyPeerSync();
             broadcastPeerAnnounce(true);
 
             // If user joined via an ?invite=username link, automatically send a chat request
@@ -3585,6 +3872,7 @@
               direction: 'outgoing',
               timestamp: msg.timestamp || Date.now()
             });
+            publishPeerSyncState(msg.to);
             renderSidebar();
             if (!alreadyOutgoing) {
               showToast(`Chat request sent to @${msg.to}`);
@@ -3604,6 +3892,7 @@
                 from: msg.from,
                 initiator: activeSession ? !activeSession.initiator : true
               });
+              publishPeerSyncState(msg.from);
               break;
             }
 
@@ -3613,6 +3902,7 @@
               const amInitiator = (state.myUsername || '').toLowerCase() > lower;
               state.pendingRequests.delete(lower);
               const session = ensureChatSession(msg.from, amInitiator);
+              session.partnerConfirmedActive = true;
               appendSystemMessage(
                 session,
                 `Ephemeral 1-to-1 chat established with @${msg.from}. Messages and files will auto-wipe on close.`
@@ -3627,6 +3917,8 @@
                 from: msg.from,
                 initiator: !amInitiator
               });
+              publishPeerSyncState(msg.from);
+              broadcastPeerAnnounce(false, true);
               setTimeout(() => {
                 if (state.chats.has(lower)) {
                   sendWs({
@@ -3634,6 +3926,7 @@
                     from: msg.from,
                     initiator: !amInitiator
                   });
+                  publishPeerSyncState(msg.from);
                 }
               }, 1200);
               break;
@@ -3671,6 +3964,7 @@
             state.pendingRequests.delete(lower);
 
             const session = ensureChatSession(partner, Boolean(msg.initiator));
+            session.partnerConfirmedActive = true;
             if (!alreadyExisted) {
               appendSystemMessage(
                 session,
@@ -3679,6 +3973,8 @@
               selectActiveChat(lower);
               setupWebRtcForSession(session);
               showToast(`Connected with @${partner}`);
+              publishPeerSyncState(partner);
+              broadcastPeerAnnounce(false, true);
             } else if (!state.activePartnerLower) {
               selectActiveChat(lower);
             }
@@ -3689,6 +3985,7 @@
           case 'chat_declined': {
             const lower = (msg.from || '').toLowerCase();
             state.pendingRequests.delete(lower);
+            publishPeerSyncState(msg.from, true);
             renderSidebar();
             showToast(`@${msg.from} declined the chat request.`);
             break;
@@ -3708,6 +4005,7 @@
               );
               setupWebRtcForSession(session);
             }
+            session.partnerConfirmedActive = true;
 
             // Always acknowledge receipt of the message ID so sender stops retrying
             if (msg.id) {
@@ -3756,16 +4054,20 @@
               sendReadReceiptForSession(session);
               renderSidebar();
             }
+            publishPeerSyncState(session.partner);
             break;
           }
 
           case 'chat_message_ack': {
             const lower = (msg.from || msg.to || '').toLowerCase();
             const session = state.chats.get(lower);
-            if (session && msg.id) {
-              const targetMsg = session.messages.find((m) => m.id === msg.id);
-              if (targetMsg) {
-                targetMsg.delivered = true;
+            if (session) {
+              session.partnerConfirmedActive = true;
+              if (msg.id) {
+                const targetMsg = session.messages.find((m) => m.id === msg.id);
+                if (targetMsg) {
+                  targetMsg.delivered = true;
+                }
               }
             }
             break;
@@ -3775,6 +4077,7 @@
             const lower = (msg.from || '').toLowerCase();
             const session = state.chats.get(lower);
             if (!session) break;
+            session.partnerConfirmedActive = true;
 
             // Only mark specific outgoing messages/files as Read when their IDs are explicitly acknowledged by the partner
             const ackIds = Array.isArray(msg.messageIds) ? new Set(msg.messageIds) : null;
@@ -3794,8 +4097,11 @@
                 updated = true;
               }
             }
-            if (updated && state.activePartnerLower === lower) {
-              renderMessagesForActiveChat();
+            if (updated) {
+              publishPeerSyncState(session.partner);
+              if (state.activePartnerLower === lower) {
+                renderMessagesForActiveChat();
+              }
             }
             break;
           }
@@ -3937,6 +4243,8 @@
             partner: partnerUsername,
             lower,
             initiator,
+            partnerConfirmedActive: false,
+            lastAcceptSyncAt: 0,
             unread: 0,
             partnerTyping: false,
             typingTimeout: null,
@@ -3959,6 +4267,7 @@
         const session = state.chats.get(lower);
         if (!session) return;
 
+        const partnerName = session.partner;
         clearTimeout(session.typingTimeout);
 
         for (const transfer of session.files.values()) {
@@ -4002,6 +4311,9 @@
 
         session.messages.length = 0;
         state.chats.delete(lower);
+        if (partnerName) {
+          publishPeerSyncState(partnerName, true);
+        }
 
         if (state.activePartnerLower === lower) {
           state.activePartnerLower = null;
@@ -4019,9 +4331,15 @@
         for (const lower of Array.from(state.chats.keys())) {
           wipeSingleChatSession(lower);
         }
+        for (const [, req] of state.pendingRequests.entries()) {
+          if (req && req.username) {
+            publishPeerSyncState(req.username, true);
+          }
+        }
         state.pendingRequests.clear();
         state.onlineUsers = [];
         state.myUsername = '';
+        state.sessionStartedAt = 0;
         state.activePartnerLower = null;
         state.searchQuery = '';
         els.userSearchInput.value = '';
@@ -5021,12 +5339,24 @@
       }
 
       function sendReadReceiptForSession(session) {
-        if (!session || state.activePartnerLower !== session.lower) return;
+        if (!session || !state.chats.has(session.lower)) return;
+        if (state.activePartnerLower !== session.lower) return;
         if (document.visibilityState && document.visibilityState === 'hidden') return;
+        if (
+          typeof window !== 'undefined' &&
+          window.innerWidth <= 767 &&
+          els.workspaceView.getAttribute('data-mobile-pane') !== 'chat'
+        ) {
+          return;
+        }
 
         const unreadIds = [];
         for (const m of session.messages) {
           if (m.direction === 'incoming' && m.id && !m.ackReadSent) {
+            if (m.kind === 'file') {
+              const tf = session.files.get(m.fileId);
+              if (!tf || tf.status !== 'completed') continue;
+            }
             m.ackReadSent = true;
             unreadIds.push(m.id);
           }
@@ -5037,6 +5367,7 @@
             to: session.partner,
             messageIds: unreadIds
           });
+          publishPeerSyncState(session.partner);
         }
       }
 
@@ -5361,9 +5692,12 @@
           showToast(`Connected with @${partnerName}`);
           renderSidebar();
           sendWs({ type: 'chat_accept', from: partnerName, initiator: true });
+          publishPeerSyncState(partnerName);
+          broadcastPeerAnnounce(false, true);
           setTimeout(() => {
             if (state.chats.has(lower)) {
               sendWs({ type: 'chat_accept', from: partnerName, initiator: true });
+              publishPeerSyncState(partnerName);
             }
           }, 1200);
           return;
@@ -5379,6 +5713,8 @@
         renderSidebar();
         showToast(`Chat request sent to @${cleanTarget}`);
         sendWs({ type: 'chat_request', to: cleanTarget });
+        publishPeerSyncState(cleanTarget);
+        broadcastPeerAnnounce(false, true);
       }
 
       els.userSearchInput.addEventListener('keydown', (e) => {
@@ -5438,9 +5774,12 @@
             showToast(`Connected with @${from}`);
             renderSidebar();
             sendWs({ type: 'chat_accept', from, initiator: true });
+            publishPeerSyncState(from);
+            broadcastPeerAnnounce(false, true);
             setTimeout(() => {
               if (state.chats.has(lower)) {
                 sendWs({ type: 'chat_accept', from, initiator: true });
+                publishPeerSyncState(from);
               }
             }, 1200);
           }
@@ -5449,6 +5788,7 @@
           if (from) {
             state.pendingRequests.delete(from.toLowerCase());
             sendWs({ type: 'chat_decline', from });
+            publishPeerSyncState(from, true);
             renderSidebar();
           }
         } else if (action === 'cancel-request') {
@@ -5456,6 +5796,7 @@
           if (to) {
             state.pendingRequests.delete(to.toLowerCase());
             sendWs({ type: 'chat_request_cancel', to });
+            publishPeerSyncState(to, true);
             renderSidebar();
           }
         } else if (action === 'open-chat') {
@@ -5480,7 +5821,9 @@
 
       // Mobile Back Button
       els.mobileBackBtn.addEventListener('click', () => {
+        state.activePartnerLower = null;
         els.workspaceView.setAttribute('data-mobile-pane', 'sidebar');
+        renderSidebar();
       });
 
       // Message Composer & Typing Indicator
@@ -5546,6 +5889,7 @@
           to: session.partner,
           text
         });
+        publishPeerSyncState(session.partner);
 
         renderMessagesForActiveChat();
         renderSidebar();
@@ -5710,10 +6054,39 @@
 
       function handleVisibilityOrFocusResume() {
         if (state.intentionalLogout) return;
-        if (document.visibilityState && document.visibilityState !== 'visible') return;
+        if (document.visibilityState && document.visibilityState === 'hidden') {
+          if (state.myUsername) {
+            for (const session of state.chats.values()) {
+              publishPeerSyncState(session.partner);
+            }
+            for (const [, req] of state.pendingRequests.entries()) {
+              if (req && req.direction === 'outgoing') {
+                publishPeerSyncState(req.username);
+              }
+            }
+          }
+          return;
+        }
         connectWebSocket();
+        initGlobalMeshRelay();
         flushHttpTransport();
         if (state.myUsername) {
+          subscribeMyPeerSync();
+          broadcastPeerAnnounce(true, true);
+          for (const session of state.chats.values()) {
+            publishPeerSyncState(session.partner);
+          }
+          for (const [, req] of state.pendingRequests.entries()) {
+            if (req && req.direction === 'outgoing') {
+              publishPeerSyncState(req.username);
+            }
+          }
+          if (state.activePartnerLower) {
+            const activeSession = state.chats.get(state.activePartnerLower);
+            if (activeSession) {
+              sendReadReceiptForSession(activeSession);
+            }
+          }
           fetchFastDirectorySearch(state.searchQuery);
         }
       }
